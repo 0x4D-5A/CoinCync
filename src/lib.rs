@@ -98,6 +98,7 @@ pub mod tick_adapter;
 // public block/tip signals; sends nothing). See docs/architecture/colony.md.
 pub mod colony;
 pub mod compliance; // auditor-facing disclosure packages (compliant-privacy use case)
+pub mod security; // chain-wide "security detail" pattern: guards + scan over attack surfaces
 
 // ── Network genesis definitions ─────────────────────────────
 pub mod mainnet;

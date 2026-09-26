@@ -20,6 +20,11 @@ pub mod spark;
 /// `docs/design/cip-triptych-ki-binding.md`.
 #[cfg(feature = "sketch-gk-proof")]
 pub mod spark_pool;
+/// Read-only "Secret Service" protection detail over the Spark pool: guards
+/// (fail-closed invariants), CIA (surveillance scan), FBI (forensic
+/// investigation). Reporting only; never mutates consensus.
+#[cfg(feature = "sketch-gk-proof")]
+pub mod pool_security;
 
 pub use utxos::{OutputRef, UtxoBatch, UtxoSet};
 

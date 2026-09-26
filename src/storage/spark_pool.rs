@@ -298,6 +298,33 @@ impl SparkPoolStore {
         self.spent_tags.read().contains_key(&tag.0)
     }
 
+    /// The height a tag was spent at, if spent. (Read-only; used by the pool
+    /// security service for forensic investigation.)
+    pub fn spent_tag_height(&self, tag: &Nullifier) -> Option<u64> {
+        self.spent_tags.read().get(&tag.0).copied()
+    }
+
+    /// Number of spent tags.
+    pub fn spent_tag_count(&self) -> usize {
+        self.spent_tags.read().len()
+    }
+
+    /// The highest block height any coin was minted at (`None` if empty).
+    pub fn max_coin_height(&self) -> Option<u64> {
+        self.coins.read().iter().map(|c| c.height).max()
+    }
+
+    /// The highest block height any tag was spent at (`None` if none spent).
+    pub fn max_spent_tag_height(&self) -> Option<u64> {
+        self.spent_tags.read().values().copied().max()
+    }
+
+    /// How many coins were minted at `height` or later — a velocity signal for
+    /// the surveillance scan.
+    pub fn coins_at_or_after(&self, height: u64) -> usize {
+        self.coins.read().iter().filter(|c| c.height >= height).count()
+    }
+
     /// A snapshot of the spent VRF-tag set — passed straight to
     /// `SparkBackend::verify_solvency` as the `spent_tags` the proof's revealed
     /// tag must NOT be in.
