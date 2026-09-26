@@ -537,6 +537,33 @@ mod tests {
     }
 
     #[test]
+    fn redteam_baseline_and_log_survive_hostile_input() {
+        // Baseline: extreme + degenerate inputs must not panic.
+        let mut b = Baseline::new(0.5, 3);
+        b.update(f64::MAX);
+        b.update(f64::MIN_POSITIVE);
+        b.update(0.0);
+        b.update(1e300);
+        let _ = b.is_anomalous(f64::MAX, 3.0); // no panic
+        let _ = b.is_anomalous(f64::NAN, 3.0); // NaN comparison → false, no panic
+        assert!(!Baseline::new(0.5, 1000).is_anomalous(1e18, 3.0), "still in warmup, never flags");
+
+        // IncidentLog with the minimum cap floods to a bounded ring but counts all.
+        let log = IncidentLog::new(0); // clamped to >= 1
+        for _ in 0..1000 {
+            log.push_alert("x", Severity::Warning, AlertClass::Operational, "flood", "");
+        }
+        assert_eq!(log.recent(100).len(), 1, "ring stays bounded under flood");
+        assert_eq!(log.total(), 1000, "totals count everything");
+        assert_eq!(log.repeat_count("flood"), 1, "only retained window counts");
+
+        // Correlation on an empty log is empty, not a panic.
+        let empty = IncidentLog::default();
+        assert!(empty.escalations(1).is_empty());
+        assert_eq!(empty.distinct_alert_kinds(), 0);
+    }
+
+    #[test]
     fn severity_orders_and_displays() {
         assert!(Severity::Critical > Severity::Warning);
         assert!(Severity::Warning > Severity::Info);

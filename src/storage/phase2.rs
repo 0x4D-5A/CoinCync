@@ -332,6 +332,20 @@ mod tests {
     }
 
     #[test]
+    fn redteam_lockstep_detail_on_empty_and_single_store() {
+        use crate::security::SecurityDetail;
+        // No stores: lock-step is vacuously true → clean, no panic.
+        let none: [&dyn Phase2Store; 0] = [];
+        let d0 = Phase2LockstepDetail::new(&none, 0);
+        assert!(d0.sweep().is_clean());
+        // One store: trivially in lock-step with itself.
+        let a = MockStore::new("a");
+        let one: [&dyn Phase2Store; 1] = [&a];
+        let d1 = Phase2LockstepDetail::new(&one, 5);
+        assert!(d1.sweep().is_clean());
+    }
+
+    #[test]
     fn lockstep_detail_flags_desync_as_consensus_critical() {
         use crate::security::{SecurityCommand, SecurityDetail};
 

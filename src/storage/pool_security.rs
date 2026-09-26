@@ -332,6 +332,45 @@ mod tests {
     }
 
     #[test]
+    fn redteam_guard_boundaries_and_scan_degenerates_dont_slip_or_crash() {
+        let ss = SecretService::new();
+
+        // Guard boundary: a coin at EXACTLY tip is legal; tip+1 is not; u64::MAX
+        // is caught when tip is below it. No off-by-one slip.
+        let store = SparkPoolStore::new();
+        store.add_coin(b"op:0".to_vec(), coin(1), b"c".to_vec(), 100);
+        assert!(ss.guard(&store, 100).is_empty(), "coin at exactly tip is legal");
+        assert!(!ss.guard(&store, 99).is_empty(), "coin one above tip is caught");
+
+        let store_max = SparkPoolStore::new();
+        store_max.add_coin(b"op:m".to_vec(), coin(2), b"c".to_vec(), u64::MAX);
+        assert!(!ss.guard(&store_max, 1000).is_empty(), "u64::MAX height is caught");
+
+        // Scan degenerates: empty pool must not divide-by-zero or panic.
+        let empty = SparkPoolStore::new();
+        let r = ss.cia_scan(&empty, 0);
+        assert_eq!(r.coin_count, 0);
+        assert!(r.anomalies.is_empty());
+
+        // Pathological: more spent tags than coins (can't happen honestly) must
+        // still not panic and just flags the ratio.
+        let weird = SparkPoolStore::new();
+        weird.add_coin(b"op:x".to_vec(), coin(3), b"c".to_vec(), 1);
+        for t in 0u8..5 {
+            weird.mark_tag_spent(&nf(t), 1);
+        }
+        let _ = ss.cia_scan(&weird, 1); // must not panic
+
+        // FBI on garbage subjects → benign findings, never a panic.
+        assert_eq!(ss.fbi_investigate(&empty, &Subject::Tag(nf(0xEE))), Finding::TagUnspent);
+        assert_eq!(ss.fbi_investigate(&empty, &Subject::Outpoint(vec![])), Finding::CoinAbsent);
+        assert_eq!(
+            ss.fbi_investigate(&empty, &Subject::Outpoint(vec![0xFF; 1024])),
+            Finding::CoinAbsent
+        );
+    }
+
+    #[test]
     fn pool_plugs_into_the_chain_wide_security_command() {
         use crate::security::{SecurityCommand, SecurityDetail};
         let store = SparkPoolStore::new();
