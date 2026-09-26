@@ -174,6 +174,66 @@ impl SecurityCommand {
     }
 }
 
+/// An adaptive baseline for one operational metric: an exponentially-weighted
+/// moving mean + variance. A detail feeds observations in and asks whether a
+/// new value is anomalous *relative to the learned norm*, instead of comparing
+/// to a hard-coded threshold that is wrong for regtest and wrong for mainnet.
+///
+/// EWMA variance (Finch/West form): keeps recent behavior weighted over old, so
+/// the baseline tracks a drifting chain. Never flags during a warmup window
+/// (too few samples to have a norm yet).
+#[derive(Clone, Debug)]
+pub struct Baseline {
+    mean: f64,
+    var: f64,
+    alpha: f64,
+    samples: u64,
+    warmup: u64,
+}
+
+impl Baseline {
+    /// `alpha` in (0,1] is the smoothing factor (higher = more reactive).
+    /// `warmup` observations must accrue before anything is flagged.
+    pub fn new(alpha: f64, warmup: u64) -> Self {
+        Self { mean: 0.0, var: 0.0, alpha: alpha.clamp(f64::MIN_POSITIVE, 1.0), samples: 0, warmup }
+    }
+
+    /// Fold one observation into the baseline.
+    pub fn update(&mut self, x: f64) {
+        if self.samples == 0 {
+            self.mean = x;
+        } else {
+            let diff = x - self.mean;
+            let incr = self.alpha * diff;
+            self.mean += incr;
+            self.var = (1.0 - self.alpha) * (self.var + diff * incr);
+        }
+        self.samples += 1;
+    }
+
+    pub fn mean(&self) -> f64 {
+        self.mean
+    }
+
+    pub fn stddev(&self) -> f64 {
+        self.var.max(0.0).sqrt()
+    }
+
+    pub fn samples(&self) -> u64 {
+        self.samples
+    }
+
+    /// Is `x` anomalous — more than `k` standard deviations from the mean —
+    /// given enough history? Returns false during warmup (no norm yet). With a
+    /// (near-)zero variance, only an exact-mean value is non-anomalous.
+    pub fn is_anomalous(&self, x: f64, k: f64) -> bool {
+        if self.samples < self.warmup {
+            return false;
+        }
+        (x - self.mean).abs() > k * self.stddev()
+    }
+}
+
 /// One recorded security event: a monotonic sequence number, the chain height
 /// it was observed at, and the alert. The incident log is the operator's
 /// audit trail — what the guards saw, when.
@@ -283,6 +343,48 @@ impl IncidentLog {
     /// wants to see is zero.
     pub fn total_consensus_halts(&self) -> u64 {
         self.inner.read().total_consensus_halts
+    }
+
+    // ── Correlation ──────────────────────────────────────────────────────────
+    // A single operational warning is noise; the *same* warning firing over and
+    // over, or many distinct alerts firing together, is signal. These queries
+    // run over the retained window (stateful where the state already lives), so
+    // a console can escalate a repeated/broad pattern without extra bookkeeping.
+
+    /// How many retained incidents carry `code`.
+    pub fn repeat_count(&self, code: &str) -> usize {
+        self.inner.read().ring.iter().filter(|i| i.alert.code == code).count()
+    }
+
+    /// Distinct `(detail, code)` pairs in the retained window — the *breadth* of
+    /// what is firing. Many distinct alerts at once is a correlation signal.
+    pub fn distinct_alert_kinds(&self) -> usize {
+        use std::collections::HashSet;
+        let g = self.inner.read();
+        g.ring
+            .iter()
+            .map(|i| (i.alert.detail, i.alert.code))
+            .collect::<HashSet<_>>()
+            .len()
+    }
+
+    /// Codes whose retained-window count reaches `threshold` — an escalation
+    /// list a console promotes above single-shot noise (paired with each code's
+    /// count). Deterministic order (by count desc, then code).
+    pub fn escalations(&self, threshold: usize) -> Vec<(String, usize)> {
+        use std::collections::HashMap;
+        let g = self.inner.read();
+        let mut counts: HashMap<&str, usize> = HashMap::new();
+        for i in g.ring.iter() {
+            *counts.entry(i.alert.code).or_insert(0) += 1;
+        }
+        let mut out: Vec<(String, usize)> = counts
+            .into_iter()
+            .filter(|(_, n)| *n >= threshold)
+            .map(|(c, n)| (c.to_string(), n))
+            .collect();
+        out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        out
     }
 }
 
@@ -397,6 +499,41 @@ mod tests {
         assert_eq!(log.total(), 2);
         assert_eq!(log.total_consensus_halts(), 1);
         assert!(log.recent(10).iter().all(|i| i.height == 42));
+    }
+
+    #[test]
+    fn baseline_learns_a_norm_and_flags_deviation() {
+        let mut b = Baseline::new(0.3, 5);
+        // Warmup: even a wild value is not flagged (no norm yet).
+        assert!(!b.is_anomalous(9999.0, 3.0));
+        // Feed a stable-ish series around 100.
+        for x in [100.0, 101.0, 99.0, 100.0, 101.0, 99.0, 100.0, 100.0] {
+            b.update(x);
+        }
+        assert!((b.mean() - 100.0).abs() < 5.0, "mean settled near 100");
+        // A value near the norm is fine; a large excursion is anomalous.
+        assert!(!b.is_anomalous(101.0, 3.0), "within-norm value is not anomalous");
+        assert!(b.is_anomalous(1000.0, 3.0), "10x excursion is anomalous");
+    }
+
+    #[test]
+    fn incident_log_correlates_repeats_and_breadth() {
+        let log = IncidentLog::new(100);
+        // Same code five times → repeat signal.
+        for _ in 0..5 {
+            log.push_alert("pool", Severity::Warning, AlertClass::Operational, "high-mint-velocity", "burst");
+        }
+        // Two other distinct codes once each.
+        log.push_alert("pool", Severity::Warning, AlertClass::Operational, "high-spend-ratio", "drain");
+        log.push_alert("utxo", Severity::Warning, AlertClass::Operational, "dust-flood", "spam");
+
+        assert_eq!(log.repeat_count("high-mint-velocity"), 5);
+        assert_eq!(log.repeat_count("nope"), 0);
+        assert_eq!(log.distinct_alert_kinds(), 3);
+
+        // Escalate only codes seen >= 3 times → just the repeated one.
+        let esc = log.escalations(3);
+        assert_eq!(esc, vec![("high-mint-velocity".to_string(), 5)]);
     }
 
     #[test]

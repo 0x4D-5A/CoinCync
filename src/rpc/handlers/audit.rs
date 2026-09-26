@@ -559,10 +559,20 @@ pub(super) fn register(module: &mut RpcModule<RpcState>) -> Result<()> {
                 })
                 .collect();
 
+            // Correlation: codes firing >= 3 times in the retained window,
+            // promoted above single-shot noise (code + count).
+            let escalations: Vec<serde_json::Value> = log
+                .escalations(3)
+                .into_iter()
+                .map(|(code, count)| json!({ "code": code, "count": count }))
+                .collect();
+
             Ok::<_, ErrorObjectOwned>(json!({
                 "total_incidents": log.total(),
                 "consensus_halts": log.total_consensus_halts(),
                 "live_consensus_halt": live.has_consensus_halt(),
+                "distinct_alert_kinds": log.distinct_alert_kinds(),
+                "escalations": escalations,
                 "recent": recent,
                 "live_alerts": live_alerts,
             }))
