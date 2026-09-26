@@ -442,6 +442,12 @@ pub struct Blockchain {
     pub cut_through:
         Option<Arc<parking_lot::Mutex<crate::crypto::mw_cutthrough::CutThroughEngine>>>,
 
+    /// The security console's incident log — the durable(ish) audit trail of
+    /// every guard/scan alert across subsystems. Always present (the security
+    /// framework is not gated); populated as details sweep. An operator RPC
+    /// reads it. See `src/security/`.
+    pub security_log: Arc<crate::security::IncidentLog>,
+
     /// CIP-009.D rolling soft-finality adapter — see
     /// `src/consensus/rolling_finality.rs`. `None` (or feature off)
     /// means the soft-finality reorg rule is dormant; setting it to
@@ -517,6 +523,7 @@ impl Blockchain {
             #[cfg(feature = "sketch-gk-proof")]
             spark_pool_store: None,
             cut_through: None,
+            security_log: Arc::new(crate::security::IncidentLog::default()),
             // CIP-009.D rolling finality: dormant until the operator
             // wires an adapter and `ROLLING_FINALITY_ENFORCE_HEIGHT`
             // is reached.
@@ -562,6 +569,7 @@ impl Blockchain {
             #[cfg(feature = "sketch-gk-proof")]
             spark_pool_store: None,
             cut_through: None,
+            security_log: Arc::new(crate::security::IncidentLog::default()),
             // CIP-009.D rolling finality: dormant until the operator
             // wires an adapter and `ROLLING_FINALITY_ENFORCE_HEIGHT`
             // is reached.
@@ -929,7 +937,12 @@ impl Blockchain {
             let detail =
                 crate::storage::pool_security::PoolSecurityDetail::new(store.as_ref(), height);
             let details: [&dyn SecurityDetail; 1] = [&detail];
-            if let Err(report) = SecurityCommand::assert_consensus_safe(&details) {
+            let report = SecurityCommand::sweep_all(&details);
+            // Record every alert (criticals + operational anomalies) to the
+            // console's incident log + tracing, so the operator sees them — then
+            // halt only on a consensus-critical.
+            self.security_log.record_report(height, &report);
+            if report.has_consensus_halt() {
                 let codes: Vec<&str> = report.criticals().map(|a| a.code).collect();
                 panic!(
                     "CONSENSUS FAULT: shielded-pool guard tripped after apply at h{height}: \

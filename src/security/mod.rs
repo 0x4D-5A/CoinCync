@@ -19,7 +19,10 @@
 //! details live with their subsystems (e.g. the shielded pool's detail is gated
 //! with the pool).
 
+use std::collections::VecDeque;
 use std::fmt;
+
+use parking_lot::RwLock;
 
 /// How serious an alert is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -171,6 +174,125 @@ impl SecurityCommand {
     }
 }
 
+/// One recorded security event: a monotonic sequence number, the chain height
+/// it was observed at, and the alert. The incident log is the operator's
+/// audit trail — what the guards saw, when.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Incident {
+    pub seq: u64,
+    pub height: u64,
+    pub alert: Alert,
+}
+
+/// A bounded, thread-safe, append-only record of security events, plus the
+/// running totals an operator's console reads. Bounded (oldest evicted past the
+/// cap) so a long-running node's memory stays flat; durable persistence to a
+/// column family is a follow-up (the shape here is the source of truth).
+pub struct IncidentLog {
+    inner: RwLock<Inner>,
+    cap: usize,
+}
+
+struct Inner {
+    seq: u64,
+    total: u64,
+    total_consensus_halts: u64,
+    ring: VecDeque<Incident>,
+}
+
+impl IncidentLog {
+    /// A log retaining the most recent `cap` incidents.
+    pub fn new(cap: usize) -> Self {
+        Self {
+            inner: RwLock::new(Inner {
+                seq: 0,
+                total: 0,
+                total_consensus_halts: 0,
+                ring: VecDeque::new(),
+            }),
+            cap: cap.max(1),
+        }
+    }
+
+    /// Record one alert observed at `height`. Also emits it to `tracing` at the
+    /// right level (a consensus halt is an error; operational is a warning).
+    /// Returns the assigned sequence number.
+    pub fn record(&self, height: u64, alert: Alert) -> u64 {
+        match (alert.severity, alert.class) {
+            (Severity::Critical, AlertClass::Consensus) => tracing::error!(
+                target: "security",
+                detail = alert.detail, code = alert.code, height, "CONSENSUS HALT: {}", alert.message
+            ),
+            (Severity::Critical, AlertClass::Operational) => tracing::warn!(
+                target: "security",
+                detail = alert.detail, code = alert.code, height, "critical anomaly: {}", alert.message
+            ),
+            (Severity::Warning, _) => tracing::warn!(
+                target: "security",
+                detail = alert.detail, code = alert.code, height, "{}", alert.message
+            ),
+            (Severity::Info, _) => tracing::info!(
+                target: "security",
+                detail = alert.detail, code = alert.code, height, "{}", alert.message
+            ),
+        }
+        let mut g = self.inner.write();
+        g.seq += 1;
+        g.total += 1;
+        if alert.severity == Severity::Critical && alert.class == AlertClass::Consensus {
+            g.total_consensus_halts += 1;
+        }
+        let seq = g.seq;
+        g.ring.push_back(Incident { seq, height, alert });
+        while g.ring.len() > self.cap {
+            g.ring.pop_front();
+        }
+        seq
+    }
+
+    /// Record every alert in a sweep report (with tracing emission).
+    pub fn record_report(&self, height: u64, report: &SecurityReport) {
+        for a in &report.alerts {
+            self.record(height, a.clone());
+        }
+    }
+
+    /// The most recent `n` incidents, newest last.
+    pub fn recent(&self, n: usize) -> Vec<Incident> {
+        let g = self.inner.read();
+        let start = g.ring.len().saturating_sub(n);
+        g.ring.iter().skip(start).cloned().collect()
+    }
+
+    /// Recent incidents at or above a severity, newest last.
+    pub fn recent_at_least(&self, severity: Severity, n: usize) -> Vec<Incident> {
+        let g = self.inner.read();
+        let mut out: Vec<Incident> =
+            g.ring.iter().filter(|i| i.alert.severity >= severity).cloned().collect();
+        let start = out.len().saturating_sub(n);
+        out.drain(..start);
+        out
+    }
+
+    /// Total incidents ever recorded (including evicted ones).
+    pub fn total(&self) -> u64 {
+        self.inner.read().total
+    }
+
+    /// Total consensus-halt events ever recorded — the number an operator most
+    /// wants to see is zero.
+    pub fn total_consensus_halts(&self) -> u64 {
+        self.inner.read().total_consensus_halts
+    }
+}
+
+impl Default for IncidentLog {
+    /// A reasonable default retention for an operator console.
+    fn default() -> Self {
+        Self::new(1024)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -235,6 +357,46 @@ mod tests {
         let details: [&dyn SecurityDetail; 2] = [&a, &b];
         let ok = SecurityCommand::assert_consensus_safe(&details).expect("no consensus halt");
         assert!(ok.is_clean());
+    }
+
+    #[test]
+    fn incident_log_records_bounds_and_queries() {
+        let log = IncidentLog::new(3); // small cap to exercise eviction
+        for h in 1..=5u64 {
+            log.push_alert("t", Severity::Warning, AlertClass::Operational, "warn", format!("at {h}"));
+        }
+        // Bounded to the last 3; total counts all 5.
+        assert_eq!(log.total(), 5);
+        let recent = log.recent(10);
+        assert_eq!(recent.len(), 3, "ring bounded to cap");
+        assert_eq!(recent.first().unwrap().alert.message, "at 3");
+        assert_eq!(recent.last().unwrap().alert.message, "at 5");
+        assert_eq!(recent.last().unwrap().seq, 5, "monotonic seq survives eviction");
+
+        // A consensus halt is counted separately.
+        assert_eq!(log.total_consensus_halts(), 0);
+        log.push_alert("t", Severity::Critical, AlertClass::Consensus, "crit", "broke");
+        assert_eq!(log.total_consensus_halts(), 1);
+        assert_eq!(log.recent_at_least(Severity::Critical, 10).len(), 1);
+    }
+
+    // Convenience so the tests can push alerts without building structs.
+    impl IncidentLog {
+        fn push_alert(&self, detail: &'static str, sev: Severity, class: AlertClass, code: &'static str, msg: impl Into<String>) -> u64 {
+            self.record(0, Alert { detail, severity: sev, class, code, message: msg.into() })
+        }
+    }
+
+    #[test]
+    fn record_report_emits_all_alerts() {
+        let log = IncidentLog::default();
+        let mut r = SecurityReport::clean();
+        r.raise_consensus("pool", Severity::Critical, "c", "x");
+        r.raise_operational("pool", Severity::Warning, "w", "y");
+        log.record_report(42, &r);
+        assert_eq!(log.total(), 2);
+        assert_eq!(log.total_consensus_halts(), 1);
+        assert!(log.recent(10).iter().all(|i| i.height == 42));
     }
 
     #[test]

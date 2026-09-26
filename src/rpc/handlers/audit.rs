@@ -521,6 +521,58 @@ pub(super) fn register(module: &mut RpcModule<RpcState>) -> Result<()> {
         })
         .map_err(|e| Error::RpcError(e.to_string()))?;
 
+    // The operator's security console: the incident log's running totals +
+    // recent alerts, plus a fresh live sweep of the shielded-pool detail. Gated
+    // at the transport layer by the RPC server's Bearer auth (set a token to
+    // fail closed to maintainers), matching the Colony live-security tier.
+    module
+        .register_method("get_pool_security", |_params, state, _ext| {
+            let log = &state.chain.security_log;
+            let incident_json = |i: &crate::security::Incident| {
+                json!({
+                    "seq": i.seq,
+                    "height": i.height,
+                    "detail": i.alert.detail,
+                    "severity": i.alert.severity.to_string(),
+                    "class": format!("{:?}", i.alert.class),
+                    "code": i.alert.code,
+                    "message": i.alert.message,
+                })
+            };
+            let recent: Vec<serde_json::Value> = log.recent(50).iter().map(incident_json).collect();
+
+            // A fresh live sweep of the pool detail (only when the gated pool
+            // store exists), so the console shows current state, not just history.
+            #[allow(unused_mut)]
+            let mut live_pool_alerts: Vec<serde_json::Value> = Vec::new();
+            #[cfg(feature = "sketch-gk-proof")]
+            if let Some(store) = &state.chain.spark_pool_store {
+                use crate::security::{SecurityCommand, SecurityDetail};
+                let detail = crate::storage::pool_security::PoolSecurityDetail::new(
+                    store.as_ref(),
+                    state.chain.height(),
+                );
+                let details: [&dyn SecurityDetail; 1] = [&detail];
+                for a in SecurityCommand::sweep_all(&details).alerts {
+                    live_pool_alerts.push(json!({
+                        "detail": a.detail,
+                        "severity": a.severity.to_string(),
+                        "class": format!("{:?}", a.class),
+                        "code": a.code,
+                        "message": a.message,
+                    }));
+                }
+            }
+
+            Ok::<_, ErrorObjectOwned>(json!({
+                "total_incidents": log.total(),
+                "consensus_halts": log.total_consensus_halts(),
+                "recent": recent,
+                "live_pool_alerts": live_pool_alerts,
+            }))
+        })
+        .map_err(|e| Error::RpcError(e.to_string()))?;
+
     Ok(())
 }
 
