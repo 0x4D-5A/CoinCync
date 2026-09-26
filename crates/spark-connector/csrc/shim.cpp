@@ -728,6 +728,64 @@ int spark_ffi_build_spend_over_set(const unsigned char* seed, int seed_len,
     }
 }
 
+// Extract a spend bundle's OUTPUT coins (the spend's change/payments) and their
+// shared serial context, so the pool can be fed with them (symmetric with the
+// mint feed). libspark derives an output coin's serial context as the
+// serialization of the spend's linking tags T (spend_transaction.cpp), so it is
+// deterministic + recoverable. Writes coins as [u32 count][ (u32 len)(bytes) ]
+// to `out_coins` and the context bytes to `out_ctx`. Returns 1 on success.
+int spark_ffi_spend_outputs(const unsigned char* ptr, int len,
+                            unsigned char* out_coins, int coins_cap, int* out_coins_len,
+                            unsigned char* out_ctx, int ctx_cap, int* out_ctx_len) {
+    try {
+        const spark::Params* params = spark::Params::get_test();
+        CDataStream ss((const char*)ptr, (const char*)ptr + len, SER_NETWORK, PROTOCOL_VERSION);
+        uint64_t cover_set_id;
+        std::vector<unsigned char> rep;
+        uint256 block_hash;
+        std::vector<spark::Coin> cover_set, out_coins_v;
+        uint64_t output_count;
+        ss >> cover_set_id;
+        ss >> rep;
+        ss >> block_hash;
+        ss >> cover_set;
+        ss >> out_coins_v;
+        ss >> output_count;
+        spark::SpendTransaction tx(params, spark::SpendTransactionVersion::V2, (std::size_t)output_count);
+        ss >> tx;
+
+        // Output coin serial context = serialize(spend tags T), per libspark
+        // (spend_transaction.cpp). `getUsedLTags()` exposes the same tags T.
+        CDataStream sc(SER_NETWORK, PROTOCOL_VERSION);
+        sc << tx.getUsedLTags();
+        if ((int)sc.size() > ctx_cap) return 0;
+        std::copy(sc.begin(), sc.end(), out_ctx);
+        *out_ctx_len = (int)sc.size();
+
+        // Serialize the output coins: [u32 count][ (u32 len)(bytes) ]...
+        std::vector<unsigned char> cbuf;
+        auto put_u32 = [&](uint32_t v) {
+            cbuf.push_back(v & 0xff);
+            cbuf.push_back((v >> 8) & 0xff);
+            cbuf.push_back((v >> 16) & 0xff);
+            cbuf.push_back((v >> 24) & 0xff);
+        };
+        put_u32((uint32_t)out_coins_v.size());
+        for (auto& c : out_coins_v) {
+            CDataStream cs(SER_NETWORK, PROTOCOL_VERSION);
+            cs << c;
+            put_u32((uint32_t)cs.size());
+            cbuf.insert(cbuf.end(), cs.begin(), cs.end());
+        }
+        if ((int)cbuf.size() > coins_cap) return 0;
+        std::copy(cbuf.begin(), cbuf.end(), out_coins);
+        *out_coins_len = (int)cbuf.size();
+        return 1;
+    } catch (...) {
+        return 0;
+    }
+}
+
 // ── Mint bundle: authenticated shield-in (transparent -> shielded). ─────────
 // A libspark MintTransaction proves each coin's value commitment C opens to its
 // PUBLIC value v (a Schnorr proof over C − G·v = H·hash_val(k)), so a verifier

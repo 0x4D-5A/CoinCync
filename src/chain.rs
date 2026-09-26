@@ -901,6 +901,22 @@ impl Blockchain {
                     }
                 }
             }
+
+            // Spend outputs: feed the spend's change/payment coins into the pool,
+            // keyed by a per-coin id (robust to pure-shielded txs) with the
+            // recoverable serial context = serialize(spend tags). Symmetric with
+            // the mint feed. A coin already present (idempotent reorg re-apply)
+            // is skipped, not a fault.
+            if let Some(sb) = &payload.spend {
+                if let Some((out_coins, out_ctx)) =
+                    spark_connector::ffi::spend_outputs(&sb.bundle)
+                {
+                    for coin in &out_coins {
+                        let key = blake3::hash(&coin.0).as_bytes().to_vec();
+                        let _ = store.add_coin(key, coin.clone(), out_ctx.clone(), height);
+                    }
+                }
+            }
         }
     }
 
@@ -4345,8 +4361,14 @@ mod tests {
             chain.verify_block_spark_v2(std::slice::from_ref(&spend_tx)).is_ok(),
             "chain verify hook accepts the unspent spend"
         );
-        // Apply hook: marks the tag spent.
+        // Apply hook: marks the tag spent AND feeds the spend's output coin(s)
+        // back into the pool (symmetric with the mint feed).
+        let coins_before_spend = store.coin_count();
         chain.apply_spark_v2_txs(std::slice::from_ref(&spend_tx), 2);
+        assert!(
+            store.coin_count() > coins_before_spend,
+            "spend output coin(s) fed into the pool"
+        );
         // Now the same spend is rejected by the verify hook (tag no longer unspent).
         assert!(
             chain.verify_block_spark_v2(std::slice::from_ref(&spend_tx)).is_err(),

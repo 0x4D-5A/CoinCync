@@ -240,6 +240,16 @@ pub mod ffi {
             coins_cap: c_int,
             out_coins_len: *mut c_int,
         ) -> c_int;
+        fn spark_ffi_spend_outputs(
+            ptr: *const u8,
+            len: c_int,
+            out_coins: *mut u8,
+            coins_cap: c_int,
+            out_coins_len: *mut c_int,
+            out_ctx: *mut u8,
+            ctx_cap: c_int,
+            out_ctx_len: *mut c_int,
+        ) -> c_int;
         fn spark_ffi_address_from_seed(seed: *const u8, seed_len: c_int, out: *mut u8, cap: c_int) -> c_int;
         fn spark_ffi_identify(
             seed: *const u8,
@@ -413,6 +423,56 @@ pub mod ffi {
             off += l;
         }
         Some((total, coins))
+    }
+
+    /// Extract a spend bundle's OUTPUT coins (change/payments) and their shared
+    /// serial context (libspark derives it as `serialize(spend tags)`, so it is
+    /// deterministic + recoverable). Feeds the pool after a spend verifies, so
+    /// the pool grows with spend outputs symmetric with the mint feed. `None` on
+    /// error. Call only on a bundle that already verified.
+    pub fn spend_outputs(bundle: &[u8]) -> Option<(Vec<CoinBytes>, Vec<u8>)> {
+        let mut coins_buf = vec![0u8; 1 << 16];
+        let mut coins_len: c_int = 0;
+        let mut ctx_buf = vec![0u8; 4096];
+        let mut ctx_len: c_int = 0;
+        // Safety: shim reads `bundle`, writes up to the buffer caps.
+        let rc = unsafe {
+            spark_ffi_spend_outputs(
+                bundle.as_ptr(),
+                bundle.len() as c_int,
+                coins_buf.as_mut_ptr(),
+                coins_buf.len() as c_int,
+                &mut coins_len,
+                ctx_buf.as_mut_ptr(),
+                ctx_buf.len() as c_int,
+                &mut ctx_len,
+            )
+        };
+        if rc != 1 {
+            return None;
+        }
+        ctx_buf.truncate(ctx_len.max(0) as usize);
+        let buf = &coins_buf[..(coins_len.max(0) as usize)];
+        let mut off = 0usize;
+        let rd = |b: &[u8], o: &mut usize| -> Option<u32> {
+            if *o + 4 > b.len() {
+                return None;
+            }
+            let v = u32::from_le_bytes([b[*o], b[*o + 1], b[*o + 2], b[*o + 3]]);
+            *o += 4;
+            Some(v)
+        };
+        let count = rd(buf, &mut off)? as usize;
+        let mut coins = Vec::with_capacity(count);
+        for _ in 0..count {
+            let l = rd(buf, &mut off)? as usize;
+            if off + l > buf.len() {
+                return None;
+            }
+            coins.push(CoinBytes(buf[off..off + l].to_vec()));
+            off += l;
+        }
+        Some((coins, ctx_buf))
     }
 
     /// The Grootle cover-set cardinality `N = n_grootle ^ m_grootle` for the
