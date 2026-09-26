@@ -24,6 +24,9 @@ use std::fmt;
 
 use parking_lot::RwLock;
 
+/// Supply-integrity detail (inflation surface). See [`supply`].
+pub mod supply;
+
 /// How serious an alert is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Severity {

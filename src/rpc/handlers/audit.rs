@@ -548,6 +548,7 @@ pub(super) fn register(module: &mut RpcModule<RpcState>) -> Result<()> {
             // here; never from block-apply).
             let mut live = state.chain.security_sweep(state.chain.height());
             live.merge(state.chain.utxo_security());
+            live.merge(state.chain.supply_security());
             {
                 use crate::security::SecurityDetail;
                 let mp = state.mempool.read();

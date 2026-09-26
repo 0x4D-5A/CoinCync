@@ -761,6 +761,21 @@ impl Blockchain {
         SecurityCommand::sweep_all(&details)
     }
 
+    /// The supply-integrity detail's report (inflation surface): the deepest
+    /// value invariant — `total_burned ≤ total_supply` (consensus-critical) plus
+    /// an over-cap operational warning. Snapshots the supply counters under the
+    /// `inner` read lock, so — like [`utxo_security`](Self::utxo_security) — it
+    /// is safe from a path that does NOT already hold `inner`, never from
+    /// block-apply. Pure (no incident-log write).
+    pub fn supply_security(&self) -> crate::security::SecurityReport {
+        use crate::security::SecurityDetail;
+        let (total_supply, total_burned) = {
+            let inner = self.inner.read();
+            (inner.stats.total_supply, inner.stats.total_burned)
+        };
+        crate::security::supply::SupplySecurityDetail::new(total_supply, total_burned).sweep()
+    }
+
     /// Verify every shielded tx's spend proofs against the live accumulator —
     /// membership (bucket anon-set) + nullifier binding + spend message. This is
     /// the store-aware verification the stateless `check_shielded_tx` cannot do;
