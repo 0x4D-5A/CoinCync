@@ -40,7 +40,15 @@ pub struct SpendBundle {
 pub struct SparkPayload {
     /// Format version — must be [`SPARK_PAYLOAD_VERSION`].
     pub version: u8,
-    /// libspark-serialized mint coins created by this tx (one per shielded vout).
+    /// An AUTHENTICATED shield-in mint bundle (a libspark `MintTransaction`,
+    /// carrying the coins + a Schnorr value proof), when this tx shields value
+    /// in. Its total authenticated value must equal the shield-in amount
+    /// (`−value_balance`); the coins are fed to the pool at apply. Preferred
+    /// over `outputs` — loose coins carry no value proof.
+    pub mint: Option<Vec<u8>>,
+    /// Legacy loose libspark-serialized coins (unauthenticated). Retained for
+    /// the pre-mint-bundle path; empty for an authenticated shield-in. Superseded
+    /// by `mint`.
     pub outputs: Vec<Vec<u8>>,
     /// The spend, if this tx spends shielded value.
     pub spend: Option<SpendBundle>,
@@ -270,7 +278,7 @@ pub fn verify_mint_shield_in(mint_bundle: &[u8], value_balance: i64) -> Result<(
             "mint shield-in requires value_balance < 0 (value entering the pool)".into(),
         ));
     }
-    let total = spark_connector::ffi::verify_mint_bundle(mint_bundle)
+    let (total, _coins) = spark_connector::ffi::verify_mint_bundle(mint_bundle)
         .ok_or_else(|| Error::CryptoError("mint bundle failed value-proof verification".into()))?;
     let shield_in = (value_balance as i128).unsigned_abs();
     if (total as u128) != shield_in {
@@ -314,6 +322,7 @@ pub mod build {
         Some((
             SparkPayload {
                 version: SPARK_PAYLOAD_VERSION,
+            mint: None,
                 outputs,
                 spend: None,
                 value_balance,
@@ -345,6 +354,7 @@ pub mod build {
         let bundle = build_spend_over_set(seed, &cover, idx, &ctx, output_value)?;
         Some(SparkPayload {
             version: SPARK_PAYLOAD_VERSION,
+            mint: None,
             outputs: vec![],
             spend: Some(SpendBundle {
                 cover_set_id,
@@ -434,6 +444,7 @@ mod tests {
     fn payload_round_trips_and_version_gate() {
         let p = SparkPayload {
             version: SPARK_PAYLOAD_VERSION,
+            mint: None,
             outputs: vec![vec![1u8; 40], vec![2u8; 40]],
             spend: Some(SpendBundle {
                 cover_set_id: 7,
@@ -471,6 +482,7 @@ mod tests {
         let store = SparkPoolStore::new();
         let p = SparkPayload {
             version: SPARK_PAYLOAD_VERSION,
+            mint: None,
             outputs: vec![vec![1u8; 40]],
             spend: None,
             value_balance: 1000,
@@ -487,6 +499,7 @@ mod tests {
         let store = SparkPoolStore::new();
         let p = SparkPayload {
             version: SPARK_PAYLOAD_VERSION,
+            mint: None,
             outputs: vec![],
             spend: Some(SpendBundle {
                 cover_set_id: 0,
@@ -506,6 +519,7 @@ mod tests {
         let inputs = vec![vec![0xABu8; 36]];
         let payload = SparkPayload {
             version: SPARK_PAYLOAD_VERSION,
+            mint: None,
             outputs: vec![vec![1u8; 40], vec![2u8; 40]],
             spend: None,
             value_balance: 0,
@@ -519,6 +533,7 @@ mod tests {
         // Re-applying the same tag → double-spend error.
         let empty = SparkPayload {
             version: SPARK_PAYLOAD_VERSION,
+            mint: None,
             outputs: vec![],
             spend: None,
             value_balance: 0,
@@ -556,6 +571,7 @@ mod tests {
 
         let payload = SparkPayload {
             version: SPARK_PAYLOAD_VERSION,
+            mint: None,
             outputs: vec![], // spend-only for this test
             spend: Some(SpendBundle {
                 cover_set_id: 0,

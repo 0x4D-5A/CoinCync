@@ -786,9 +786,13 @@ int spark_ffi_build_mint_bundle(const unsigned char* seed, int seed_len,
 }
 
 // Verify a mint bundle and, on success, write the total authenticated minted
-// value (Σ v) to `out_total`. Returns 1 iff the value proof verifies and the
-// sum does not overflow; 0 otherwise (fail-closed).
-int spark_ffi_verify_mint_bundle(const unsigned char* ptr, int len, uint64_t* out_total) {
+// value (Σ v) to `out_total` AND the individual coins to `out_coins` as
+// [u32 count][ (u32 len)(coin bytes) ]... (the same shape the cover-set /
+// build_spend_over_set path consumes) so the caller can feed them to the pool.
+// Returns 1 iff the value proof verifies, the sum does not overflow, and the
+// coins fit; 0 otherwise (fail-closed).
+int spark_ffi_verify_mint_bundle(const unsigned char* ptr, int len, uint64_t* out_total,
+                                 unsigned char* out_coins, int coins_cap, int* out_coins_len) {
     try {
         const spark::Params* params = spark::Params::get_test();
         std::size_t off = 0;
@@ -825,6 +829,25 @@ int spark_ffi_verify_mint_bundle(const unsigned char* ptr, int len, uint64_t* ou
             if (total > std::numeric_limits<uint64_t>::max() - c.v) return 0; // overflow
             total += c.v;
         }
+
+        // Serialize the coins for the caller: [u32 count][ (u32 len)(bytes) ]...
+        std::vector<unsigned char> cbuf;
+        auto put_u32 = [&](uint32_t v) {
+            cbuf.push_back(v & 0xff);
+            cbuf.push_back((v >> 8) & 0xff);
+            cbuf.push_back((v >> 16) & 0xff);
+            cbuf.push_back((v >> 24) & 0xff);
+        };
+        put_u32((uint32_t)coins.size());
+        for (auto& c : coins) {
+            CDataStream cs(SER_NETWORK, PROTOCOL_VERSION);
+            cs << c;
+            put_u32((uint32_t)cs.size());
+            cbuf.insert(cbuf.end(), cs.begin(), cs.end());
+        }
+        if ((int)cbuf.size() > coins_cap) return 0;
+        std::copy(cbuf.begin(), cbuf.end(), out_coins);
+        *out_coins_len = (int)cbuf.size();
         *out_total = total;
         return 1;
     } catch (...) {

@@ -786,6 +786,13 @@ impl Blockchain {
                 payload.value_balance,
             )
             .map_err(|e| format!("spark v2 tx {idx}: value bridge: {e}"))?;
+            // Authenticated shield-in: the minted coins' total value proof must
+            // equal the value entering the pool (−value_balance). Together with
+            // the bridge above this fully conserves value across the veil.
+            if let Some(mint) = &payload.mint {
+                crate::consensus::spark_payload::verify_mint_shield_in(mint, payload.value_balance)
+                    .map_err(|e| format!("spark v2 tx {idx}: mint: {e}"))?;
+            }
             let tags = crate::consensus::spark_payload::verify_spark_payload(
                 store.as_ref(),
                 &backend,
@@ -863,6 +870,37 @@ impl Blockchain {
                     "CONSENSUS FAULT: spark v2 apply failed (tx {idx}, h{height}): {e}. Halting."
                 )
             });
+
+            // Authenticated shield-in: feed the mint bundle's coins into the
+            // pool. The value proof was checked at verify (verify_mint_shield_in);
+            // re-verify here to extract the coins, then add each keyed by its
+            // deterministic outpoint. All coins in a mint share the tx-level
+            // serial context.
+            if let Some(mint) = &payload.mint {
+                let (_total, coins) = spark_connector::ffi::verify_mint_bundle(mint)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "CONSENSUS FAULT: spark v2 mint bundle failed at apply (tx {idx}, \
+                             h{height}). Validation should have rejected. Halting."
+                        )
+                    });
+                let mint_ctx = spark_connector::ffi::serial_context(
+                    &crate::consensus::spark_payload::derive_outpoint(&input_outpoints, 0),
+                )
+                .expect("serial_context derivation is infallible");
+                for (i, coin) in coins.iter().enumerate() {
+                    let op = crate::consensus::spark_payload::derive_outpoint(
+                        &input_outpoints,
+                        i as u32,
+                    );
+                    if store.add_coin(op, coin.clone(), mint_ctx.clone(), height).is_none() {
+                        panic!(
+                            "CONSENSUS FAULT: duplicate mint coin outpoint (tx {idx}, h{height}). \
+                             Halting."
+                        );
+                    }
+                }
+            }
         }
     }
 
@@ -4313,6 +4351,56 @@ mod tests {
         assert!(
             chain.verify_block_spark_v2(std::slice::from_ref(&spend_tx)).is_err(),
             "chain verify hook rejects the now-spent spend (double-spend guard)"
+        );
+    }
+
+    /// An AUTHENTICATED shield-in: a `TxType::Shielded` tx whose payload carries
+    /// a libspark mint bundle is fed into the pool by the apply hook, with each
+    /// minted coin added by its deterministic outpoint. Exercises the payload
+    /// carriage of `SparkPayload::mint` end-to-end through `apply_spark_v2_txs`.
+    #[cfg(all(feature = "sketch-gk-proof", feature = "libspark-ffi"))]
+    #[test]
+    fn spark_v2_authenticated_mint_bundle_feeds_pool() {
+        use crate::consensus::spark_payload::{derive_outpoint, SparkPayload, SPARK_PAYLOAD_VERSION};
+        use crate::storage::spark_pool::SparkPoolStore;
+        use crate::transaction::{Transaction, TxType};
+        use spark_connector::ffi::{build_mint_bundle, serial_context};
+        use std::sync::Arc;
+
+        let mut chain = Blockchain::new();
+        chain.spark_pool_store = Some(Arc::new(SparkPoolStore::new()));
+        let store = Arc::clone(chain.spark_pool_store.as_ref().unwrap());
+
+        // Build an authenticated mint bundle bound to the tx-level context the
+        // apply hook derives (empty transparent inputs → derive_outpoint(&[], 0)).
+        let seed = b"authenticated-mint-seed";
+        let values = [1_000u64, 2_000, 3_000];
+        let mint_ctx = serial_context(&derive_outpoint(&[], 0)).unwrap();
+        let bundle = build_mint_bundle(seed, &values, &mint_ctx).unwrap();
+
+        let payload = SparkPayload {
+            version: SPARK_PAYLOAD_VERSION,
+            mint: Some(bundle),
+            outputs: vec![],
+            spend: None,
+            value_balance: -(values.iter().sum::<u64>() as i64),
+        };
+        let mint_tx = Transaction {
+            version: 1,
+            tx_type: TxType::Shielded,
+            inputs: vec![],
+            outputs: vec![],
+            fee: crate::primitives::Amount::from_atomic(0),
+            range_proof: vec![],
+            extra: payload.encode(),
+        };
+
+        // The apply hook feeds the pool with the authenticated coins.
+        chain.apply_spark_v2_txs(std::slice::from_ref(&mint_tx), 1);
+        assert_eq!(
+            store.coin_count(),
+            values.len(),
+            "authenticated mint bundle fed all coins into the pool"
         );
     }
 

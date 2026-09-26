@@ -232,7 +232,14 @@ pub mod ffi {
             out: *mut u8,
             cap: c_int,
         ) -> c_int;
-        fn spark_ffi_verify_mint_bundle(ptr: *const u8, len: c_int, out_total: *mut u64) -> c_int;
+        fn spark_ffi_verify_mint_bundle(
+            ptr: *const u8,
+            len: c_int,
+            out_total: *mut u64,
+            out_coins: *mut u8,
+            coins_cap: c_int,
+            out_coins_len: *mut c_int,
+        ) -> c_int;
         fn spark_ffi_address_from_seed(seed: *const u8, seed_len: c_int, out: *mut u8, cap: c_int) -> c_int;
         fn spark_ffi_identify(
             seed: *const u8,
@@ -360,22 +367,52 @@ pub mod ffi {
     }
 
     /// Verify a mint bundle and return the total AUTHENTICATED minted value
-    /// (`Σ v`, proven to match the coins' commitments). `None` if the value
-    /// proof fails, the bundle is malformed, or the sum overflows — fail-closed.
-    /// A shield-in tx is sound iff this total equals the value that entered the
+    /// (`Σ v`, proven to match the coins' commitments) together with the
+    /// individual minted coins (to feed the pool). `None` if the value proof
+    /// fails, the bundle is malformed, or the sum overflows — fail-closed.
+    /// A shield-in tx is sound iff the total equals the value that entered the
     /// pool (`−value_balance`), which the transparent bridge ties to the
     /// transparent commitments.
-    pub fn verify_mint_bundle(bundle: &[u8]) -> Option<u64> {
+    pub fn verify_mint_bundle(bundle: &[u8]) -> Option<(u64, Vec<CoinBytes>)> {
         let mut total: u64 = 0;
-        // Safety: shim only reads `bundle` and writes `total`.
+        let mut coins_buf = vec![0u8; 1 << 16];
+        let mut coins_len: c_int = 0;
+        // Safety: shim reads `bundle`, writes `total` + up to coins_buf.len() into coins_buf.
         let rc = unsafe {
-            spark_ffi_verify_mint_bundle(bundle.as_ptr(), bundle.len() as c_int, &mut total)
+            spark_ffi_verify_mint_bundle(
+                bundle.as_ptr(),
+                bundle.len() as c_int,
+                &mut total,
+                coins_buf.as_mut_ptr(),
+                coins_buf.len() as c_int,
+                &mut coins_len,
+            )
         };
-        if rc == 1 {
-            Some(total)
-        } else {
-            None
+        if rc != 1 {
+            return None;
         }
+        // Parse coins: [u32 count][ (u32 len)(bytes) ]...
+        let buf = &coins_buf[..(coins_len.max(0) as usize)];
+        let mut off = 0usize;
+        let rd = |b: &[u8], o: &mut usize| -> Option<u32> {
+            if *o + 4 > b.len() {
+                return None;
+            }
+            let v = u32::from_le_bytes([b[*o], b[*o + 1], b[*o + 2], b[*o + 3]]);
+            *o += 4;
+            Some(v)
+        };
+        let count = rd(buf, &mut off)? as usize;
+        let mut coins = Vec::with_capacity(count);
+        for _ in 0..count {
+            let l = rd(buf, &mut off)? as usize;
+            if off + l > buf.len() {
+                return None;
+            }
+            coins.push(CoinBytes(buf[off..off + l].to_vec()));
+            off += l;
+        }
+        Some((total, coins))
     }
 
     /// The Grootle cover-set cardinality `N = n_grootle ^ m_grootle` for the
@@ -682,8 +719,9 @@ pub mod ffi {
             let ctx = serial_context(b"mint:tx:0").expect("ctx");
             let values = [100u64, 200, 300, 400];
             let bundle = build_mint_bundle(seed, &values, &ctx).expect("build mint bundle");
-            let total = verify_mint_bundle(&bundle).expect("mint bundle verifies");
+            let (total, coins) = verify_mint_bundle(&bundle).expect("mint bundle verifies");
             assert_eq!(total, 1000, "total = Σ minted values, authenticated");
+            assert_eq!(coins.len(), values.len(), "one coin per minted value");
 
             // Tampering the bundle (flip a byte in the proof/coin region) fails.
             let mut bad = bundle.clone();
