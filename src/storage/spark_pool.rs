@@ -112,6 +112,11 @@ pub struct SparkPoolStore {
     /// Reorg checkpoint stack (in lock-step with the block-apply path when
     /// wired), capped at `MAX_CHECKPOINTS`.
     checkpoints: RwLock<Vec<PoolCheckpoint>>,
+    /// Maintained max coin/tag heights so the security guard is O(1) on the hot
+    /// path (a per-block O(n) scan would itself be a DoS as the pool grows).
+    /// Updated on add/mark; recomputed on the (rare) rewind.
+    max_coin_height: RwLock<Option<u64>>,
+    max_spent_tag_height: RwLock<Option<u64>>,
     /// RocksDB-backed persistence. `None` for in-memory tests.
     persistence: Option<SparkPoolPersistence>,
 }
@@ -124,6 +129,8 @@ impl SparkPoolStore {
             by_outpoint: RwLock::new(HashMap::new()),
             spent_tags: RwLock::new(HashMap::new()),
             checkpoints: RwLock::new(Vec::new()),
+            max_coin_height: RwLock::new(None),
+            max_spent_tag_height: RwLock::new(None),
             persistence: None,
         }
     }
@@ -173,11 +180,15 @@ impl SparkPoolStore {
             spent_tags.insert(key.as_ref().to_vec(), u64::from_le_bytes(h_bytes));
         }
 
+        let max_coin_height = coins.iter().map(|c| c.height).max();
+        let max_spent_tag_height = spent_tags.values().copied().max();
         Ok(Self {
             coins: RwLock::new(coins),
             by_outpoint: RwLock::new(by_outpoint),
             spent_tags: RwLock::new(spent_tags),
             checkpoints: RwLock::new(Vec::new()),
+            max_coin_height: RwLock::new(max_coin_height),
+            max_spent_tag_height: RwLock::new(max_spent_tag_height),
             persistence: Some(SparkPoolPersistence {
                 coins: coins_tree,
                 tags: tags_tree,
@@ -229,6 +240,9 @@ impl SparkPoolStore {
         }
         by_op.insert(outpoint, cover_index);
         coins.push(entry);
+        // O(1) guard maintenance.
+        let mut m = self.max_coin_height.write();
+        *m = Some(m.map_or(height, |cur| cur.max(height)));
         Some(cover_index)
     }
 
@@ -290,6 +304,9 @@ impl SparkPoolStore {
             }
         }
         tags.insert(tag.0.clone(), height);
+        // O(1) guard maintenance.
+        let mut m = self.max_spent_tag_height.write();
+        *m = Some(m.map_or(height, |cur| cur.max(height)));
         true
     }
 
@@ -309,14 +326,16 @@ impl SparkPoolStore {
         self.spent_tags.read().len()
     }
 
-    /// The highest block height any coin was minted at (`None` if empty).
+    /// The highest block height any coin was minted at (`None` if empty). O(1):
+    /// a maintained field, so the security guard never scans the pool.
     pub fn max_coin_height(&self) -> Option<u64> {
-        self.coins.read().iter().map(|c| c.height).max()
+        *self.max_coin_height.read()
     }
 
     /// The highest block height any tag was spent at (`None` if none spent).
+    /// O(1) maintained field.
     pub fn max_spent_tag_height(&self) -> Option<u64> {
-        self.spent_tags.read().values().copied().max()
+        *self.max_spent_tag_height.read()
     }
 
     /// How many coins were minted at `height` or later — a velocity signal for
@@ -416,6 +435,11 @@ impl SparkPoolStore {
                 let _ = p.tags.remove(t.as_slice());
             }
         }
+
+        // Recompute the O(1) guard maxes from the surviving state (rewind is
+        // rare, so an O(n) recompute here is fine; the hot path stays O(1)).
+        *self.max_coin_height.write() = self.coins.read().iter().map(|c| c.height).max();
+        *self.max_spent_tag_height.write() = self.spent_tags.read().values().copied().max();
         true
     }
 }

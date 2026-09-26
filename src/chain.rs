@@ -918,6 +918,25 @@ impl Blockchain {
                 }
             }
         }
+
+        // Secret Service, post-apply: run the pool's O(1) consensus guard over
+        // the just-mutated state. A tripped invariant means the apply produced a
+        // state an honest node can never reach — HALT to preserve on-disk state
+        // (defense-in-depth, mirroring the R-61 persistence halts). Operational
+        // anomalies never reach here (they page, they don't halt).
+        {
+            use crate::security::{SecurityCommand, SecurityDetail};
+            let detail =
+                crate::storage::pool_security::PoolSecurityDetail::new(store.as_ref(), height);
+            let details: [&dyn SecurityDetail; 1] = [&detail];
+            if let Err(report) = SecurityCommand::assert_consensus_safe(&details) {
+                let codes: Vec<&str> = report.criticals().map(|a| a.code).collect();
+                panic!(
+                    "CONSENSUS FAULT: shielded-pool guard tripped after apply at h{height}: \
+                     {codes:?}. Halting to preserve on-disk state."
+                );
+            }
+        }
     }
 
     fn checkpoint_phase2_stores(&self, height: u64) {

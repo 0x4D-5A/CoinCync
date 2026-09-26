@@ -42,12 +42,30 @@ impl fmt::Display for Severity {
     }
 }
 
+/// Whether an alert may influence consensus. This is the load-bearing
+/// distinction (Stage 2): mixing the two is how a security layer either lets
+/// corruption through or becomes a DoS / consensus-divergence vector.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AlertClass {
+    /// A broken invariant that MUST hold identically on every honest node.
+    /// Its check is deterministic (no wall-clock, no node-local state) and
+    /// cheap (O(1) on the hot path), so it is safe to HALT/reject on. A
+    /// `Consensus` + `Critical` alert is a genuine halt condition.
+    Consensus,
+    /// A local operational heuristic (velocity, ratios, peer churn). May be
+    /// non-deterministic and O(n); it is only ever logged/paged — NEVER halts
+    /// the node, or a heuristic false-positive would wedge the chain.
+    Operational,
+}
+
 /// One finding from a security detail.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Alert {
     /// The detail that raised it (e.g. `"shielded-pool"`, `"utxo-set"`).
     pub detail: &'static str,
     pub severity: Severity,
+    /// Whether this alert may drive a consensus halt, or is operational-only.
+    pub class: AlertClass,
     /// A short stable code for the invariant/anomaly (e.g. `"coin-from-future"`).
     pub code: &'static str,
     /// Human-readable specifics.
@@ -66,9 +84,15 @@ impl SecurityReport {
         Self { alerts: Vec::new() }
     }
 
-    /// Raise an alert.
-    pub fn raise(&mut self, detail: &'static str, severity: Severity, code: &'static str, message: impl Into<String>) {
-        self.alerts.push(Alert { detail, severity, code, message: message.into() });
+    /// Raise a **consensus-critical** invariant alert (deterministic, cheap —
+    /// safe to halt on when `Critical`).
+    pub fn raise_consensus(&mut self, detail: &'static str, severity: Severity, code: &'static str, message: impl Into<String>) {
+        self.alerts.push(Alert { detail, severity, class: AlertClass::Consensus, code, message: message.into() });
+    }
+
+    /// Raise an **operational** heuristic alert (log/page only — never halts).
+    pub fn raise_operational(&mut self, detail: &'static str, severity: Severity, code: &'static str, message: impl Into<String>) {
+        self.alerts.push(Alert { detail, severity, class: AlertClass::Operational, code, message: message.into() });
     }
 
     /// Fold another report's alerts in.
@@ -76,13 +100,21 @@ impl SecurityReport {
         self.alerts.extend(other.alerts);
     }
 
-    /// Any critical alert present? A hard-guarantee caller treats this as a halt
-    /// condition.
+    /// Any critical alert of any class present (for paging/visibility).
     pub fn has_critical(&self) -> bool {
         self.alerts.iter().any(|a| a.severity == Severity::Critical)
     }
 
-    /// The critical alerts, if any.
+    /// A **consensus** halt condition: a `Critical` alert of class `Consensus`.
+    /// This — not `has_critical` — is what a node acts on. An operational
+    /// critical never halts.
+    pub fn has_consensus_halt(&self) -> bool {
+        self.alerts
+            .iter()
+            .any(|a| a.severity == Severity::Critical && a.class == AlertClass::Consensus)
+    }
+
+    /// The critical alerts of any class, if any.
     pub fn criticals(&self) -> impl Iterator<Item = &Alert> {
         self.alerts.iter().filter(|a| a.severity == Severity::Critical)
     }
@@ -123,11 +155,15 @@ impl SecurityCommand {
         report
     }
 
-    /// Sweep and return `Err(report)` iff any detail raised a critical alert —
-    /// the fail-closed entry point a caller uses to halt on corruption.
-    pub fn assert_secure(details: &[&dyn SecurityDetail]) -> Result<SecurityReport, SecurityReport> {
+    /// Sweep and return `Err(report)` iff a **consensus** halt condition is
+    /// present (a `Critical` + `Consensus` alert). This is the fail-closed entry
+    /// point a node wires into block-apply to halt on corruption. Operational
+    /// alerts — even `Critical` ones — never trip this; they are for paging.
+    pub fn assert_consensus_safe(
+        details: &[&dyn SecurityDetail],
+    ) -> Result<SecurityReport, SecurityReport> {
         let report = Self::sweep_all(details);
-        if report.has_critical() {
+        if report.has_consensus_halt() {
             Err(report)
         } else {
             Ok(report)
@@ -141,7 +177,8 @@ mod tests {
 
     struct MockDetail {
         label: &'static str,
-        critical: bool,
+        consensus_critical: bool,
+        operational_critical: bool,
         warnings: usize,
     }
     impl SecurityDetail for MockDetail {
@@ -150,38 +187,53 @@ mod tests {
         }
         fn sweep(&self) -> SecurityReport {
             let mut r = SecurityReport::clean();
-            if self.critical {
-                r.raise(self.label, Severity::Critical, "mock-crit", "invariant broken");
+            if self.consensus_critical {
+                r.raise_consensus(self.label, Severity::Critical, "mock-crit", "invariant broken");
+            }
+            if self.operational_critical {
+                r.raise_operational(self.label, Severity::Critical, "mock-op-crit", "severe anomaly");
             }
             for _ in 0..self.warnings {
-                r.raise(self.label, Severity::Warning, "mock-warn", "anomaly");
+                r.raise_operational(self.label, Severity::Warning, "mock-warn", "anomaly");
             }
             r
         }
     }
 
     #[test]
-    fn command_aggregates_details_and_flags_critical() {
-        let clean = MockDetail { label: "a", critical: false, warnings: 1 };
-        let broken = MockDetail { label: "b", critical: true, warnings: 2 };
+    fn command_aggregates_details_and_halts_only_on_consensus_critical() {
+        let clean = MockDetail { label: "a", consensus_critical: false, operational_critical: false, warnings: 1 };
+        let broken = MockDetail { label: "b", consensus_critical: true, operational_critical: false, warnings: 2 };
         let details: [&dyn SecurityDetail; 2] = [&clean, &broken];
 
         let report = SecurityCommand::sweep_all(&details);
         assert_eq!(report.alerts.len(), 1 + 1 + 2, "all alerts aggregated");
         assert!(report.has_critical());
-        assert_eq!(report.criticals().count(), 1);
+        assert!(report.has_consensus_halt());
         assert_eq!(report.count_at_least(Severity::Warning), 4);
 
-        // assert_secure returns Err on a critical.
-        assert!(SecurityCommand::assert_secure(&details).is_err());
+        // A consensus-critical trips the halt.
+        assert!(SecurityCommand::assert_consensus_safe(&details).is_err());
+    }
+
+    #[test]
+    fn operational_critical_pages_but_never_halts() {
+        // The load-bearing Stage-2 property: an operational heuristic firing at
+        // Critical severity is visible (has_critical) but must NOT halt the node
+        // — otherwise a false-positive heuristic wedges the chain.
+        let noisy = MockDetail { label: "a", consensus_critical: false, operational_critical: true, warnings: 3 };
+        let details: [&dyn SecurityDetail; 1] = [&noisy];
+        let report = SecurityCommand::assert_consensus_safe(&details).expect("operational critical does not halt");
+        assert!(report.has_critical(), "still visible for paging");
+        assert!(!report.has_consensus_halt(), "but never a consensus halt");
     }
 
     #[test]
     fn all_clean_details_pass() {
-        let a = MockDetail { label: "a", critical: false, warnings: 0 };
-        let b = MockDetail { label: "b", critical: false, warnings: 0 };
+        let a = MockDetail { label: "a", consensus_critical: false, operational_critical: false, warnings: 0 };
+        let b = MockDetail { label: "b", consensus_critical: false, operational_critical: false, warnings: 0 };
         let details: [&dyn SecurityDetail; 2] = [&a, &b];
-        let ok = SecurityCommand::assert_secure(&details).expect("no criticals");
+        let ok = SecurityCommand::assert_consensus_safe(&details).expect("no consensus halt");
         assert!(ok.is_clean());
     }
 

@@ -245,7 +245,8 @@ impl crate::security::SecurityDetail for PoolSecurityDetail<'_> {
                     format!("reorg checkpoint stack {count} exceeds bound {max}"),
                 ),
             };
-            r.raise("shielded-pool", Severity::Critical, code, msg);
+            // Guards are deterministic + O(1) → consensus-critical (safe to halt).
+            r.raise_consensus("shielded-pool", Severity::Critical, code, msg);
         }
 
         for a in self.svc.cia_scan(self.store, self.tip).anomalies {
@@ -259,7 +260,8 @@ impl crate::security::SecurityDetail for PoolSecurityDetail<'_> {
                     format!("{spent}/{coins} coins spent — pool draining"),
                 ),
             };
-            r.raise("shielded-pool", Severity::Warning, code, msg);
+            // Anomalies are heuristic → operational (page, never halt).
+            r.raise_operational("shielded-pool", Severity::Warning, code, msg);
         }
         r
     }
@@ -335,17 +337,17 @@ mod tests {
         let store = SparkPoolStore::new();
         store.add_coin(b"op:0".to_vec(), coin(1), b"c".to_vec(), 50);
 
-        // Clean at a sane tip: no criticals.
+        // Clean at a sane tip: no consensus halt.
         let detail = PoolSecurityDetail::new(&store, 100);
         let details: [&dyn SecurityDetail; 1] = [&detail];
-        assert!(SecurityCommand::assert_secure(&details).is_ok());
+        assert!(SecurityCommand::assert_consensus_safe(&details).is_ok());
 
-        // At an impossibly-low tip the coin is "from the future" → a critical
-        // alert bubbles up through the coordinator.
+        // At an impossibly-low tip the coin is "from the future" → a
+        // consensus-critical alert halts through the coordinator.
         let detail_bad = PoolSecurityDetail::new(&store, 10);
         let bad: [&dyn SecurityDetail; 1] = [&detail_bad];
-        let report = SecurityCommand::assert_secure(&bad).unwrap_err();
-        assert!(report.has_critical());
+        let report = SecurityCommand::assert_consensus_safe(&bad).unwrap_err();
+        assert!(report.has_consensus_halt());
         assert_eq!(detail_bad.label(), "shielded-pool");
         assert!(report.criticals().any(|a| a.code == "coin-from-future"));
     }
