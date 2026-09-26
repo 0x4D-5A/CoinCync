@@ -154,6 +154,40 @@ pub enum RewindOutcome {
     Stranded { remaining: usize },
 }
 
+/// A [`SecurityDetail`](crate::security::SecurityDetail) over the Phase-2
+/// accumulator stores: it flags them drifting out of checkpoint lock-step. If
+/// the three stores' checkpoint stacks disagree, a reorg unwinds them to
+/// different heights and diverges chain state — a consensus-critical corruption
+/// surface. The check is `check_lockstep` (O(number of stores), so O(1)),
+/// deterministic, and read-only, so it is safe as a consensus guard.
+pub struct Phase2LockstepDetail<'a> {
+    stores: &'a [&'a dyn Phase2Store],
+    height: u64,
+}
+
+impl<'a> Phase2LockstepDetail<'a> {
+    /// `height` is the current chain height (context for the alert message).
+    pub fn new(stores: &'a [&'a dyn Phase2Store], height: u64) -> Self {
+        Self { stores, height }
+    }
+}
+
+impl crate::security::SecurityDetail for Phase2LockstepDetail<'_> {
+    fn label(&self) -> &'static str {
+        "phase2-lockstep"
+    }
+
+    fn sweep(&self) -> crate::security::SecurityReport {
+        use crate::security::{SecurityReport, Severity};
+        let mut r = SecurityReport::clean();
+        if let Err(msg) = check_lockstep(self.stores, self.height) {
+            // Deterministic + O(1) → consensus-critical (safe to halt on).
+            r.raise_consensus("phase2-lockstep", Severity::Critical, "store-desync", msg);
+        }
+        r
+    }
+}
+
 /// Rewind every store by one checkpoint (disconnect one block), classifying each
 /// result. Pure over the slice + the stores' own state; the caller does the
 /// logging so this stays testable.
@@ -295,6 +329,37 @@ mod tests {
         let stores: [&dyn Phase2Store; 1] = [&s];
         let outcomes = rewind_all(&stores);
         assert!(matches!(outcomes[0].1, RewindOutcome::Stranded { remaining: 2 }));
+    }
+
+    #[test]
+    fn lockstep_detail_flags_desync_as_consensus_critical() {
+        use crate::security::{SecurityCommand, SecurityDetail};
+
+        let a = MockStore::new("a");
+        let b = MockStore::new("b");
+        let c = MockStore::new("c");
+        let stores: [&dyn Phase2Store; 3] = [&a, &b, &c];
+
+        // In lock-step → the detail is clean, no consensus halt.
+        for h in 1..=3u64 {
+            checkpoint_all(&stores, h).unwrap();
+        }
+        let detail = Phase2LockstepDetail::new(&stores, 3);
+        let details: [&dyn SecurityDetail; 1] = [&detail];
+        assert!(SecurityCommand::assert_consensus_safe(&details).is_ok());
+
+        // Force a desync: `b` silently declines its next checkpoint.
+        *b.skip_next_checkpoint.lock() = true;
+        // Drive one more checkpoint directly (bypass the lock-step driver, as a
+        // silent-skip bug would), so the stacks diverge.
+        for s in stores.iter() {
+            s.checkpoint_at_height(4);
+        }
+        let detail2 = Phase2LockstepDetail::new(&stores, 4);
+        let details2: [&dyn SecurityDetail; 1] = [&detail2];
+        let report = SecurityCommand::assert_consensus_safe(&details2).unwrap_err();
+        assert!(report.has_consensus_halt());
+        assert!(report.criticals().any(|al| al.code == "store-desync"));
     }
 
     #[test]

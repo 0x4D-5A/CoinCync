@@ -724,6 +724,29 @@ impl Blockchain {
         v
     }
 
+    /// The unified operator security sweep: run every initialized detail —
+    /// Phase-2 lock-step (always) and the shielded-pool detail (gated + present)
+    /// — under one `SecurityCommand` and return the report. **Pure** (does not
+    /// record): a read-only console query calls this without polluting the
+    /// incident log; a caller that wants an audit trail records the result
+    /// itself. `height` is the current chain height.
+    pub fn security_sweep(&self, height: u64) -> crate::security::SecurityReport {
+        use crate::security::{SecurityCommand, SecurityDetail};
+        let phase2 = self.phase2_stores();
+        let lockstep = crate::storage::phase2::Phase2LockstepDetail::new(&phase2, height);
+
+        #[cfg(feature = "sketch-gk-proof")]
+        if let Some(store) = &self.spark_pool_store {
+            let pool =
+                crate::storage::pool_security::PoolSecurityDetail::new(store.as_ref(), height);
+            let details: [&dyn SecurityDetail; 2] = [&lockstep, &pool];
+            return SecurityCommand::sweep_all(&details);
+        }
+
+        let details: [&dyn SecurityDetail; 1] = [&lockstep];
+        SecurityCommand::sweep_all(&details)
+    }
+
     /// Verify every shielded tx's spend proofs against the live accumulator —
     /// membership (bucket anon-set) + nullifier binding + spend message. This is
     /// the store-aware verification the stateless `check_shielded_tx` cannot do;
@@ -933,19 +956,15 @@ impl Blockchain {
         // (defense-in-depth, mirroring the R-61 persistence halts). Operational
         // anomalies never reach here (they page, they don't halt).
         {
-            use crate::security::{SecurityCommand, SecurityDetail};
-            let detail =
-                crate::storage::pool_security::PoolSecurityDetail::new(store.as_ref(), height);
-            let details: [&dyn SecurityDetail; 1] = [&detail];
-            let report = SecurityCommand::sweep_all(&details);
-            // Record every alert (criticals + operational anomalies) to the
-            // console's incident log + tracing, so the operator sees them — then
-            // halt only on a consensus-critical.
+            // Unified post-apply sweep (pool + Phase-2 lock-step). Record every
+            // alert to the console's incident log + tracing so the operator sees
+            // them, then halt only on a consensus-critical.
+            let report = self.security_sweep(height);
             self.security_log.record_report(height, &report);
             if report.has_consensus_halt() {
                 let codes: Vec<&str> = report.criticals().map(|a| a.code).collect();
                 panic!(
-                    "CONSENSUS FAULT: shielded-pool guard tripped after apply at h{height}: \
+                    "CONSENSUS FAULT: security guard tripped after apply at h{height}: \
                      {codes:?}. Halting to preserve on-disk state."
                 );
             }

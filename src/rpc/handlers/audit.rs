@@ -541,34 +541,30 @@ pub(super) fn register(module: &mut RpcModule<RpcState>) -> Result<()> {
             };
             let recent: Vec<serde_json::Value> = log.recent(50).iter().map(incident_json).collect();
 
-            // A fresh live sweep of the pool detail (only when the gated pool
-            // store exists), so the console shows current state, not just history.
-            #[allow(unused_mut)]
-            let mut live_pool_alerts: Vec<serde_json::Value> = Vec::new();
-            #[cfg(feature = "sketch-gk-proof")]
-            if let Some(store) = &state.chain.spark_pool_store {
-                use crate::security::{SecurityCommand, SecurityDetail};
-                let detail = crate::storage::pool_security::PoolSecurityDetail::new(
-                    store.as_ref(),
-                    state.chain.height(),
-                );
-                let details: [&dyn SecurityDetail; 1] = [&detail];
-                for a in SecurityCommand::sweep_all(&details).alerts {
-                    live_pool_alerts.push(json!({
+            // A fresh, read-only live sweep of every initialized detail (pool +
+            // Phase-2 lock-step), so the console shows current state — pure, so
+            // it does not pollute the incident log.
+            let live = state.chain.security_sweep(state.chain.height());
+            let live_alerts: Vec<serde_json::Value> = live
+                .alerts
+                .iter()
+                .map(|a| {
+                    json!({
                         "detail": a.detail,
                         "severity": a.severity.to_string(),
                         "class": format!("{:?}", a.class),
                         "code": a.code,
                         "message": a.message,
-                    }));
-                }
-            }
+                    })
+                })
+                .collect();
 
             Ok::<_, ErrorObjectOwned>(json!({
                 "total_incidents": log.total(),
                 "consensus_halts": log.total_consensus_halts(),
+                "live_consensus_halt": live.has_consensus_halt(),
                 "recent": recent,
-                "live_pool_alerts": live_pool_alerts,
+                "live_alerts": live_alerts,
             }))
         })
         .map_err(|e| Error::RpcError(e.to_string()))?;
