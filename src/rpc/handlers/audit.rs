@@ -584,6 +584,8 @@ pub(super) fn register(module: &mut RpcModule<RpcState>) -> Result<()> {
                 "total_incidents": log.total(),
                 "consensus_halts": log.total_consensus_halts(),
                 "live_consensus_halt": live.has_consensus_halt(),
+                "live_disposition": live.disposition().to_string(),
+                "coordinated_attack_suspected": live.coordinated_attack_suspected(),
                 "distinct_alert_kinds": log.distinct_alert_kinds(),
                 "escalations": escalations,
                 "recent": recent,

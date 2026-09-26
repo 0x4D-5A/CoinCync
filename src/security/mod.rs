@@ -61,6 +61,43 @@ pub enum AlertClass {
     Operational,
 }
 
+/// The recommended RESPONSE to a finding — a graduated ladder, so security does
+/// more than log-or-halt. Ordered weakest→strongest; a caller maps it to a
+/// concrete action for its context (a validator rejects, a peer manager bans, a
+/// node halts). Graduating the response also shrinks the "trip a guard to halt
+/// the network" DoS surface: most findings quarantine or ban, and only a proven
+/// self-corruption halts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Disposition {
+    /// Nothing to do.
+    Accept,
+    /// Record for the operator; no active response.
+    Log,
+    /// Rate-limit the source (soft operational pressure).
+    Throttle,
+    /// Reject this item WITHOUT halting (a bad block/tx pre-apply, an over-cap
+    /// mempool) — prevention, not a network-wide stop.
+    Quarantine,
+    /// Ban the offending peer — a repeated/abusive operational signal.
+    BanPeer,
+    /// Stop the node to preserve on-disk state — a proven self-corruption.
+    Halt,
+}
+
+impl fmt::Display for Disposition {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            Disposition::Accept => "accept",
+            Disposition::Log => "log",
+            Disposition::Throttle => "throttle",
+            Disposition::Quarantine => "quarantine",
+            Disposition::BanPeer => "ban-peer",
+            Disposition::Halt => "halt",
+        };
+        write!(f, "{s}")
+    }
+}
+
 /// One finding from a security detail.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Alert {
@@ -73,6 +110,22 @@ pub struct Alert {
     pub code: &'static str,
     /// Human-readable specifics.
     pub message: String,
+}
+
+impl Alert {
+    /// The default graduated response for this alert. A consensus-critical is a
+    /// `Halt` (or, pre-apply, a `Quarantine`/reject — the caller decides which
+    /// point it is at); an operational critical bans the source; a warning
+    /// throttles; info is logged. Details may special-case, but this is the
+    /// safe default ladder.
+    pub fn disposition(&self) -> Disposition {
+        match (self.severity, self.class) {
+            (Severity::Critical, AlertClass::Consensus) => Disposition::Halt,
+            (Severity::Critical, AlertClass::Operational) => Disposition::BanPeer,
+            (Severity::Warning, _) => Disposition::Throttle,
+            (Severity::Info, _) => Disposition::Log,
+        }
+    }
 }
 
 /// The aggregated findings of one or more details' sweeps.
@@ -130,6 +183,29 @@ impl SecurityReport {
     /// Count of alerts at or above a severity.
     pub fn count_at_least(&self, severity: Severity) -> usize {
         self.alerts.iter().filter(|a| a.severity >= severity).count()
+    }
+
+    /// The strongest recommended response across all alerts (graduated
+    /// response). `Accept` when clean. The caller acts on this: pre-apply,
+    /// `Halt`/`Quarantine` both mean "reject the block"; post-apply, `Halt`
+    /// stops the node; `BanPeer`/`Throttle` are peer/rate actions.
+    pub fn disposition(&self) -> Disposition {
+        self.alerts.iter().map(Alert::disposition).max().unwrap_or(Disposition::Accept)
+    }
+
+    /// The distinct detail labels that fired — the *breadth* of the incident.
+    pub fn distinct_details(&self) -> usize {
+        use std::collections::HashSet;
+        self.alerts.iter().map(|a| a.detail).collect::<HashSet<_>>().len()
+    }
+
+    /// Cross-surface correlation: a coordinated attack is suspected when
+    /// multiple DISTINCT subsystems raise alerts together (e.g. peer isolation
+    /// AND a pool anomaly) with at least one at Critical. A single noisy detail
+    /// is not enough — breadth across surfaces is the signal a real, staged
+    /// attack leaves.
+    pub fn coordinated_attack_suspected(&self) -> bool {
+        self.distinct_details() >= 2 && self.count_at_least(Severity::Critical) >= 1
     }
 }
 
@@ -561,6 +637,42 @@ mod tests {
         let empty = IncidentLog::default();
         assert!(empty.escalations(1).is_empty());
         assert_eq!(empty.distinct_alert_kinds(), 0);
+    }
+
+    #[test]
+    fn graduated_response_ladder_and_report_disposition() {
+        // Per-alert ladder.
+        let halt = Alert { detail: "d", severity: Severity::Critical, class: AlertClass::Consensus, code: "c", message: String::new() };
+        let ban = Alert { detail: "d", severity: Severity::Critical, class: AlertClass::Operational, code: "c", message: String::new() };
+        let thr = Alert { detail: "d", severity: Severity::Warning, class: AlertClass::Operational, code: "c", message: String::new() };
+        assert_eq!(halt.disposition(), Disposition::Halt);
+        assert_eq!(ban.disposition(), Disposition::BanPeer);
+        assert_eq!(thr.disposition(), Disposition::Throttle);
+        assert!(Disposition::Halt > Disposition::BanPeer && Disposition::BanPeer > Disposition::Throttle);
+
+        // Report takes the strongest response present.
+        let mut r = SecurityReport::clean();
+        assert_eq!(r.disposition(), Disposition::Accept);
+        r.raise_operational("d", Severity::Warning, "w", "x");
+        assert_eq!(r.disposition(), Disposition::Throttle);
+        r.raise_consensus("d", Severity::Critical, "c", "y");
+        assert_eq!(r.disposition(), Disposition::Halt, "strongest wins");
+    }
+
+    #[test]
+    fn cross_surface_correlation_needs_breadth() {
+        // One noisy detail, even with a critical, is not "coordinated".
+        let mut single = SecurityReport::clean();
+        single.raise_operational("mempool", Severity::Critical, "flood", "x");
+        assert!(!single.coordinated_attack_suspected(), "one surface is not coordinated");
+
+        // Two distinct surfaces + a critical → coordinated attack suspected
+        // (e.g. peer isolation while the pool misbehaves — a staged attack).
+        let mut multi = SecurityReport::clean();
+        multi.raise_operational("peer-set", Severity::Warning, "low-peers", "eclipse?");
+        multi.raise_consensus("shielded-pool", Severity::Critical, "coin-from-future", "!");
+        assert_eq!(multi.distinct_details(), 2);
+        assert!(multi.coordinated_attack_suspected());
     }
 
     #[test]
