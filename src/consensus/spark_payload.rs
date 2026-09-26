@@ -254,6 +254,33 @@ pub fn verify_transparent_shielded_balance(
     Ok(())
 }
 
+/// The SHIELDED-side half of shield-in value conservation: the value entering
+/// the pool (`−value_balance`, a shield has `value_balance < 0`) must equal the
+/// total AUTHENTICATED value of the minted coins. `verify_mint_bundle` verifies
+/// the libspark Schnorr value proof (each coin's commitment opens to its public
+/// value) and returns `Σ v`; this requires that sum to match the shield-in
+/// amount. Combined with `verify_transparent_shielded_balance` (which ties
+/// `value_balance` to the transparent commitments), shield-in fully conserves:
+/// `transparent in == value_balance == Σ authenticated mint v`. Gated
+/// `libspark-ffi` (needs the real backend). Fail-closed.
+#[cfg(feature = "libspark-ffi")]
+pub fn verify_mint_shield_in(mint_bundle: &[u8], value_balance: i64) -> Result<()> {
+    if value_balance >= 0 {
+        return Err(Error::CryptoError(
+            "mint shield-in requires value_balance < 0 (value entering the pool)".into(),
+        ));
+    }
+    let total = spark_connector::ffi::verify_mint_bundle(mint_bundle)
+        .ok_or_else(|| Error::CryptoError("mint bundle failed value-proof verification".into()))?;
+    let shield_in = (value_balance as i128).unsigned_abs();
+    if (total as u128) != shield_in {
+        return Err(Error::CryptoError(format!(
+            "mint total {total} != shield-in amount {shield_in} (value_balance {value_balance})"
+        )));
+    }
+    Ok(())
+}
+
 /// Mint- and spend-side v2 payload BUILDERS (the wallet side). Gated on
 /// `libspark-ffi` — they call the real backend to mint coins and build spend
 /// bundles. This is the send-side counterpart to the verify/apply feed:
@@ -549,6 +576,24 @@ mod tests {
 
         // Re-verify now fails: the tag is in the spent-set (no longer unspent).
         assert!(verify_spark_payload(&store, &backend, &payload, 0).is_err());
+    }
+
+    // Shield-in value conservation: Σ(authenticated mint v) must equal
+    // −value_balance, closing the loop with the transparent bridge.
+    #[cfg(feature = "libspark-ffi")]
+    #[test]
+    fn mint_shield_in_binds_value_balance_to_authenticated_mint_total() {
+        use spark_connector::ffi::{build_mint_bundle, serial_context};
+        let seed = b"shield-in-seed";
+        let ctx = serial_context(b"shield:tx:0").unwrap();
+        let bundle = build_mint_bundle(seed, &[100, 200, 300], &ctx).unwrap(); // total 600
+
+        // value_balance = -600 (shield 600 in) → matches the authenticated total.
+        assert!(verify_mint_shield_in(&bundle, -600).is_ok());
+        // Understated shield-in (mint 600 but claim only 500 entered) → rejected.
+        assert!(verify_mint_shield_in(&bundle, -500).is_err());
+        // Wrong sign (unshield) → rejected.
+        assert!(verify_mint_shield_in(&bundle, 600).is_err());
     }
 
     // The full wallet loop: mint BUILDER → apply feed → spend BUILDER → verify →

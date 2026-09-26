@@ -222,6 +222,17 @@ pub mod ffi {
             out: *mut u8,
             cap: c_int,
         ) -> c_int;
+        fn spark_ffi_build_mint_bundle(
+            seed: *const u8,
+            seed_len: c_int,
+            values: *const u64,
+            n_values: c_int,
+            ctx_ptr: *const u8,
+            ctx_len: c_int,
+            out: *mut u8,
+            cap: c_int,
+        ) -> c_int;
+        fn spark_ffi_verify_mint_bundle(ptr: *const u8, len: c_int, out_total: *mut u64) -> c_int;
         fn spark_ffi_address_from_seed(seed: *const u8, seed_len: c_int, out: *mut u8, cap: c_int) -> c_int;
         fn spark_ffi_identify(
             seed: *const u8,
@@ -320,6 +331,51 @@ pub mod ffi {
         }
         out.truncate(n as usize);
         Some(out)
+    }
+
+    /// Build an authenticated shield-in mint bundle (a libspark
+    /// `MintTransaction`) to the `seed` wallet for `values`, bound to `context`.
+    /// The bundle carries a Schnorr value proof so a verifier can trust each
+    /// coin's public value without the recipient's view key. `None` on error.
+    pub fn build_mint_bundle(seed: &[u8], values: &[u64], context: &[u8]) -> Option<Vec<u8>> {
+        let mut out = vec![0u8; 1 << 16];
+        // Safety: pointers/lengths valid for the call; shim writes <= cap into `out`.
+        let len = unsafe {
+            spark_ffi_build_mint_bundle(
+                seed.as_ptr(),
+                seed.len() as c_int,
+                values.as_ptr(),
+                values.len() as c_int,
+                context.as_ptr(),
+                context.len() as c_int,
+                out.as_mut_ptr(),
+                out.len() as c_int,
+            )
+        };
+        if len <= 0 {
+            return None;
+        }
+        out.truncate(len as usize);
+        Some(out)
+    }
+
+    /// Verify a mint bundle and return the total AUTHENTICATED minted value
+    /// (`Σ v`, proven to match the coins' commitments). `None` if the value
+    /// proof fails, the bundle is malformed, or the sum overflows — fail-closed.
+    /// A shield-in tx is sound iff this total equals the value that entered the
+    /// pool (`−value_balance`), which the transparent bridge ties to the
+    /// transparent commitments.
+    pub fn verify_mint_bundle(bundle: &[u8]) -> Option<u64> {
+        let mut total: u64 = 0;
+        // Safety: shim only reads `bundle` and writes `total`.
+        let rc = unsafe {
+            spark_ffi_verify_mint_bundle(bundle.as_ptr(), bundle.len() as c_int, &mut total)
+        };
+        if rc == 1 {
+            Some(total)
+        } else {
+            None
+        }
     }
 
     /// The Grootle cover-set cardinality `N = n_grootle ^ m_grootle` for the
@@ -615,6 +671,25 @@ pub mod ffi {
         fn backend_fail_closed_until_marshalling() {
             let b = LibsparkBackend;
             assert!(b.verify_spend(&[], &SpendBytes(vec![]), 0, 0).is_err());
+        }
+
+        #[test]
+        fn mint_bundle_authenticates_total_value_and_rejects_tamper() {
+            // A shield-in mint bundle: build for known values, verify, and get
+            // back the total AUTHENTICATED value (the Schnorr value proof ties
+            // each coin's commitment to its public value).
+            let seed = b"mint-bundle-seed";
+            let ctx = serial_context(b"mint:tx:0").expect("ctx");
+            let values = [100u64, 200, 300, 400];
+            let bundle = build_mint_bundle(seed, &values, &ctx).expect("build mint bundle");
+            let total = verify_mint_bundle(&bundle).expect("mint bundle verifies");
+            assert_eq!(total, 1000, "total = Σ minted values, authenticated");
+
+            // Tampering the bundle (flip a byte in the proof/coin region) fails.
+            let mut bad = bundle.clone();
+            let n = bad.len();
+            bad[n - 8] ^= 0x01;
+            assert!(verify_mint_bundle(&bad).is_none(), "tampered mint bundle rejected");
         }
 
         #[test]

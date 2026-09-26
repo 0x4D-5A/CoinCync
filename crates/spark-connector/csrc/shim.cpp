@@ -728,6 +728,110 @@ int spark_ffi_build_spend_over_set(const unsigned char* seed, int seed_len,
     }
 }
 
+// ── Mint bundle: authenticated shield-in (transparent -> shielded). ─────────
+// A libspark MintTransaction proves each coin's value commitment C opens to its
+// PUBLIC value v (a Schnorr proof over C − G·v = H·hash_val(k)), so a verifier
+// can trust the minted values without the recipient's view key. Wire format
+// (raw, little-endian): [u32 count][ (u32 len)(coin stream) ]..., where the
+// first coin stream also carries the value proof (libspark's own layout).
+
+#include "mint_transaction.h"
+
+// Build a mint bundle to the seed wallet's address for `values`, bound to the
+// serial `context`. Serializes the MintTransaction. Returns length or -1.
+int spark_ffi_build_mint_bundle(const unsigned char* seed, int seed_len,
+                                const uint64_t* values, int n_values,
+                                const unsigned char* ctx_ptr, int ctx_len,
+                                unsigned char* out, int cap) {
+    try {
+        const spark::Params* params = spark::Params::get_test();
+        spark::SpendKey spend(params, seed_to_r(seed, seed_len));
+        spark::FullViewKey full(spend);
+        spark::IncomingViewKey incoming(full);
+        spark::Address addr(incoming, 0);
+        std::vector<unsigned char> ctx(ctx_ptr, ctx_ptr + ctx_len);
+
+        std::vector<spark::MintedCoinData> outs;
+        for (int i = 0; i < n_values; i++) {
+            spark::MintedCoinData d;
+            d.address = addr;
+            d.v = values[i];
+            d.memo = "mint";
+            outs.push_back(d);
+        }
+        spark::MintTransaction mint(params, outs, ctx, true);
+        std::vector<CDataStream> streams = mint.getMintedCoinsSerialized();
+
+        std::vector<unsigned char> buf;
+        auto put_u32 = [&](uint32_t v) {
+            buf.push_back(v & 0xff);
+            buf.push_back((v >> 8) & 0xff);
+            buf.push_back((v >> 16) & 0xff);
+            buf.push_back((v >> 24) & 0xff);
+        };
+        put_u32((uint32_t)streams.size());
+        for (auto& s : streams) {
+            put_u32((uint32_t)s.size());
+            buf.insert(buf.end(), s.begin(), s.end());
+        }
+        if ((int)buf.size() > cap) return -1;
+        std::copy(buf.begin(), buf.end(), out);
+        return (int)buf.size();
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "build_mint_bundle threw: %s\n", e.what());
+        return -1;
+    } catch (...) {
+        return -1;
+    }
+}
+
+// Verify a mint bundle and, on success, write the total authenticated minted
+// value (Σ v) to `out_total`. Returns 1 iff the value proof verifies and the
+// sum does not overflow; 0 otherwise (fail-closed).
+int spark_ffi_verify_mint_bundle(const unsigned char* ptr, int len, uint64_t* out_total) {
+    try {
+        const spark::Params* params = spark::Params::get_test();
+        std::size_t off = 0;
+        auto need = [&](std::size_t n) {
+            if (off + n > (std::size_t)len) throw std::runtime_error("mint bundle truncated");
+        };
+        auto rd_u32 = [&]() -> uint32_t {
+            need(4);
+            uint32_t v = (uint32_t)ptr[off] | ((uint32_t)ptr[off + 1] << 8) |
+                         ((uint32_t)ptr[off + 2] << 16) | ((uint32_t)ptr[off + 3] << 24);
+            off += 4;
+            return v;
+        };
+        uint32_t count = rd_u32();
+        if (count == 0) return 0;
+        std::vector<CDataStream> streams;
+        streams.reserve(count);
+        for (uint32_t i = 0; i < count; i++) {
+            uint32_t sl = rd_u32();
+            need(sl);
+            streams.emplace_back((const char*)ptr + off, (const char*)ptr + off + sl,
+                                 SER_NETWORK, PROTOCOL_VERSION);
+            off += sl;
+        }
+        spark::MintTransaction mint(params);
+        mint.setMintTransaction(streams);
+        if (!mint.verify()) return 0;
+
+        std::vector<spark::Coin> coins;
+        mint.getCoins(coins);
+        uint64_t total = 0;
+        for (auto& c : coins) {
+            c.setParams(params);
+            if (total > std::numeric_limits<uint64_t>::max() - c.v) return 0; // overflow
+            total += c.v;
+        }
+        *out_total = total;
+        return 1;
+    } catch (...) {
+        return 0;
+    }
+}
+
 // Derive a DETERMINISTIC 32-byte serial context from an opaque outpoint
 // identifier (e.g. tx_hash ‖ output_index). Mint and spend MUST pass the
 // identical outpoint so the recovered (s, T) match the on-wire serial
