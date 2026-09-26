@@ -542,9 +542,12 @@ pub(super) fn register(module: &mut RpcModule<RpcState>) -> Result<()> {
             let recent: Vec<serde_json::Value> = log.recent(50).iter().map(incident_json).collect();
 
             // A fresh, read-only live sweep of every initialized detail (pool +
-            // Phase-2 lock-step), so the console shows current state — pure, so
-            // it does not pollute the incident log.
-            let live = state.chain.security_sweep(state.chain.height());
+            // Phase-2 lock-step + UTXO set), so the console shows current state
+            // — pure, so it does not pollute the incident log. The UTXO detail
+            // is merged separately because it takes the `inner` read lock (safe
+            // here; never from block-apply).
+            let mut live = state.chain.security_sweep(state.chain.height());
+            live.merge(state.chain.utxo_security());
             let live_alerts: Vec<serde_json::Value> = live
                 .alerts
                 .iter()

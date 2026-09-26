@@ -747,6 +747,20 @@ impl Blockchain {
         SecurityCommand::sweep_all(&details)
     }
 
+    /// The UTXO-set security detail's report. Kept SEPARATE from
+    /// [`security_sweep`](Self::security_sweep) because it acquires the `inner`
+    /// read lock: it is safe to call from a path that does NOT already hold
+    /// `inner` (e.g. an operator RPC), but MUST NOT be called from block-apply,
+    /// which holds the `inner` write lock (parking_lot RwLock is not reentrant —
+    /// re-locking would deadlock). Pure (no incident-log write).
+    pub fn utxo_security(&self) -> crate::security::SecurityReport {
+        use crate::security::{SecurityCommand, SecurityDetail};
+        let inner = self.inner.read();
+        let utxo = crate::storage::UtxoSecurityDetail::new(&inner.utxos);
+        let details: [&dyn SecurityDetail; 1] = [&utxo];
+        SecurityCommand::sweep_all(&details)
+    }
+
     /// Verify every shielded tx's spend proofs against the live accumulator —
     /// membership (bucket anon-set) + nullifier binding + spend message. This is
     /// the store-aware verification the stateless `check_shielded_tx` cannot do;

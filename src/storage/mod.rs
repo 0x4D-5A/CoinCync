@@ -26,7 +26,7 @@ pub mod spark_pool;
 #[cfg(feature = "sketch-gk-proof")]
 pub mod pool_security;
 
-pub use utxos::{OutputRef, UtxoBatch, UtxoSet};
+pub use utxos::{OutputRef, UtxoBatch, UtxoSecurityDetail, UtxoSet};
 
 pub use bloom::{BloomFilter, CountingBloomFilter, KeyImageFilter};
 

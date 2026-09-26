@@ -913,11 +913,101 @@ impl UtxoSet {
     }
 }
 
+/// Pure UTXO-set count invariant (testable in isolation): the live output count
+/// can never exceed the number of outputs ever created — only removals shrink
+/// the live set. A violation means the set or its counters are corrupt (a
+/// count-level inflation). Returns `Some((code, message))` on a violation.
+fn utxo_count_violation(live: u64, ever: u64) -> Option<(&'static str, String)> {
+    if live > ever {
+        Some((
+            "live-exceeds-ever",
+            format!("live UTXO count {live} exceeds ever-created {ever} — set corruption"),
+        ))
+    } else {
+        None
+    }
+}
+
+/// A [`SecurityDetail`](crate::security::SecurityDetail) over the UTXO set — the
+/// chain's core value-integrity surface. Read-only, O(1):
+/// - **Guard (consensus-critical):** live count ≤ ever-created (a count-level
+///   inflation is impossible honestly → halt).
+/// - **Scan (operational):** the live set exceeding a bloat threshold (a
+///   grief/spam signal, paged not halted).
+pub struct UtxoSecurityDetail<'a> {
+    utxos: &'a UtxoSet,
+    bloat_warn: usize,
+}
+
+impl<'a> UtxoSecurityDetail<'a> {
+    /// Default bloat warning threshold (live UTXO count).
+    pub const DEFAULT_BLOAT_WARN: usize = 50_000_000;
+
+    pub fn new(utxos: &'a UtxoSet) -> Self {
+        Self { utxos, bloat_warn: Self::DEFAULT_BLOAT_WARN }
+    }
+
+    pub fn with_bloat_warn(utxos: &'a UtxoSet, bloat_warn: usize) -> Self {
+        Self { utxos, bloat_warn }
+    }
+}
+
+impl crate::security::SecurityDetail for UtxoSecurityDetail<'_> {
+    fn label(&self) -> &'static str {
+        "utxo-set"
+    }
+
+    fn sweep(&self) -> crate::security::SecurityReport {
+        use crate::security::{SecurityReport, Severity};
+        let mut r = SecurityReport::clean();
+        let live = self.utxos.output_count() as u64;
+        let ever = self.utxos.total_outputs_ever();
+        if let Some((code, msg)) = utxo_count_violation(live, ever) {
+            r.raise_consensus("utxo-set", Severity::Critical, code, msg);
+        }
+        if self.utxos.output_count() > self.bloat_warn {
+            r.raise_operational(
+                "utxo-set",
+                Severity::Warning,
+                "utxo-bloat",
+                format!("live UTXO set {} exceeds bloat warn {}", live, self.bloat_warn),
+            );
+        }
+        r
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::decoy::OutputLocator;
     use crate::primitives::PublicKey;
+
+    #[test]
+    fn utxo_count_invariant_and_security_detail() {
+        use crate::security::SecurityDetail;
+
+        // Pure invariant: live > ever is a violation; otherwise clean.
+        assert!(super::utxo_count_violation(10, 5).is_some());
+        assert!(super::utxo_count_violation(5, 10).is_none());
+        assert!(super::utxo_count_violation(5, 5).is_none());
+
+        // A real set: add three outputs → live == ever == 3, guard clean.
+        let mut set = UtxoSet::new();
+        for i in 0..3u64 {
+            let (h, o) = make_test_output(i, None);
+            set.add_output(h, 0, o, 1);
+        }
+        assert_eq!(set.output_count(), 3);
+
+        // Bloat threshold below the live count → operational warning (no halt).
+        let report = super::UtxoSecurityDetail::with_bloat_warn(&set, 2).sweep();
+        assert!(!report.has_consensus_halt(), "no consensus halt on an honest set");
+        assert!(report.alerts.iter().any(|a| a.code == "utxo-bloat"));
+
+        // Ample threshold → completely clean.
+        assert!(super::UtxoSecurityDetail::with_bloat_warn(&set, 1_000).sweep().is_clean());
+    }
 
     fn make_test_output(id: u64, lock_height: Option<u64>) -> (Hash, TxOutput) {
         let mut bytes = [0u8; 32];
