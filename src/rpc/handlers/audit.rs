@@ -548,6 +548,16 @@ pub(super) fn register(module: &mut RpcModule<RpcState>) -> Result<()> {
             // here; never from block-apply).
             let mut live = state.chain.security_sweep(state.chain.height());
             live.merge(state.chain.utxo_security());
+            {
+                use crate::security::SecurityDetail;
+                let mp = state.mempool.read();
+                live.merge(crate::mempool::MempoolSecurityDetail::new(&mp).sweep());
+            }
+            if let Some(p2p) = &state.p2p {
+                use crate::security::SecurityDetail;
+                let peers = p2p.peer_count();
+                live.merge(crate::network::peer_security::PeerSecurityDetail::new(peers).sweep());
+            }
             let live_alerts: Vec<serde_json::Value> = live
                 .alerts
                 .iter()
