@@ -17,6 +17,20 @@
 # which previously produced an empty release-build log.
 set -euo pipefail
 
+# This is a Windows MSVC build (libspark C++ + MSVC linker). It MUST run under
+# Git Bash (MINGW64), NOT WSL/Linux bash — under WSL the paths and toolchain are
+# wrong. On Windows `bash` often resolves to C:\Windows\System32\bash.exe (WSL);
+# invoke Git Bash explicitly instead.
+case "$(uname -s)" in
+  MINGW*|MSYS*) : ;;
+  *)
+    echo "ERROR: this must run under Git Bash (MINGW64), not '$(uname -s)' (likely WSL)." >&2
+    echo "Run it from a Git Bash terminal, or from PowerShell invoke Git Bash directly:" >&2
+    echo '  & "C:\Program Files\Git\bin\bash.exe" scripts/soak-24h-shielded.sh' >&2
+    exit 1
+    ;;
+esac
+
 cd "$(dirname "$0")/.."
 
 # --- Build/link environment (edit paths here if your toolchain differs) ------
