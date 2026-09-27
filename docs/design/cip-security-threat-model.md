@@ -20,11 +20,26 @@ re-verify cryptography.
 ### supply
 - **Catches:** `total_burned > total_supply` (burn-counter inflation / accounting
   corruption) → halt. `total_supply > MAX_SUPPLY` → operational warning.
-- **Does NOT catch:** inflation *within* the cap (a block emitting more than its
-  scheduled reward while the total stays ≤ cap) — that is a per-block
-  `calculate_block_reward` check at validation, not here. Exact adherence to the
-  emission schedule (no cheap cumulative-emission function exists). Value created
-  by a proof that verifies but shouldn't (crypto).
+  **Schedule reconciliation** (added 2026-09-26): `total_supply == Σ
+  reward(0..=tip)`, recomputed independently by
+  [`emission::supply::cumulative_emission`] and reconciled in `supply_security`
+  → operational/Critical (pages, never halts). This closes the previously-named
+  "exact adherence to the emission schedule" gap: the block-connect path
+  maintains `total_supply` as this running sum, so any drift from the
+  deterministic schedule across connects, disconnects, reorgs, or restart replay
+  is now surfaced live and is auditor-verifiable via `get_supply_info` +
+  `get_pool_security`. It was previously a *test-only* invariant
+  (`tests/invariant_pipeline.rs`, `tests/common/simkit.rs`).
+- **Does NOT catch:** inflation *within* the cap at the **scheduled coin count**
+  — a block emits exactly its scheduled reward, but the coins themselves carry
+  inflated value via a balance/range proof that verifies-but-shouldn't. The
+  reconciliation checks the *schedule accounting*, not the *cryptography*, and it
+  shares the `base_reward` primitive with the counter it reconciles (a bug
+  *inside* `base_reward` is invisible to it). Per-block over-emission is caught at
+  validation (`calculate_block_reward`), not here. The schedule check is
+  operational, not a halt — promoting it would take an O(1) independently
+  maintained accumulator. Value created by a proof that verifies but shouldn't
+  (crypto) remains the audit's job.
 
 ### utxo-set
 - **Catches:** live output count `>` ever-created; distinct spent key-images `>`
