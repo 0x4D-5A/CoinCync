@@ -844,4 +844,66 @@ mod reservoir_tests {
         assert!(t.reservoir_after.as_atomic() <= 1_000_000);
         assert_eq!(t.burned.as_atomic(), 1_000_000 * DECAY_BPS / 10_000);
     }
+
+    /// Replay a synthetic fee series (calm high-fee/low-congestion blocks
+    /// alternating with drought high-congestion/low-fee blocks) and assert the
+    /// reservoir does its job: it CHARGES in calm and DISCHARGES in drought,
+    /// reducing the variance of miner revenue vs. raw fees, while staying
+    /// bounded and issuance-neutral over the whole run. This is the CIP's
+    /// "model the params via replay" step (difficulty_replay.rs style).
+    #[test]
+    fn replay_reduces_miner_revenue_variance_and_conserves_value() {
+        // 600 blocks: 50-block calm/drought phases.
+        let mut series = Vec::new();
+        for block in 0..600u64 {
+            if (block / 50) % 2 == 0 {
+                series.push((10_000u64, 10u64)); // calm: low congestion → charge
+            } else {
+                series.push((2_000u64, 90u64)); // drought: high congestion → discharge
+            }
+        }
+
+        let raw: Vec<u64> = series.iter().map(|(f, _)| *f).collect();
+
+        let mut reservoir = Amount::from_atomic(0);
+        let mut smoothed = Vec::with_capacity(series.len());
+        let (mut miner_total, mut burned_total, mut fees_total) = (0u128, 0u128, 0u128);
+        for (f, c) in &series {
+            let before = reservoir.as_atomic() as u128;
+            let t = reservoir_step(reservoir, Amount::from_atomic(*f), *c);
+            // Per-step conservation.
+            assert_eq!(
+                t.to_miner.as_atomic() as u128
+                    + t.reservoir_after.as_atomic() as u128
+                    + t.burned.as_atomic() as u128,
+                before + *f as u128
+            );
+            reservoir = t.reservoir_after;
+            smoothed.push(t.to_miner.as_atomic());
+            miner_total += t.to_miner.as_atomic() as u128;
+            burned_total += t.burned.as_atomic() as u128;
+            fees_total += *f as u128;
+        }
+
+        // Bounded, and issuance-neutral over the whole run (net consumer): all
+        // fees end up with miners, in the reservoir, or burned — never minted.
+        assert!(reservoir.as_atomic() <= CAP_ATOMIC, "reservoir stayed within the cap");
+        assert_eq!(
+            miner_total + reservoir.as_atomic() as u128 + burned_total,
+            fees_total,
+            "value conserved across the run"
+        );
+
+        // Smoothing: miner-revenue variance is reduced vs. raw fees.
+        let variance = |xs: &[u64]| -> f64 {
+            let n = xs.len() as f64;
+            let mean = xs.iter().map(|&x| x as f64).sum::<f64>() / n;
+            xs.iter().map(|&x| (x as f64 - mean).powi(2)).sum::<f64>() / n
+        };
+        let (var_raw, var_smoothed) = (variance(&raw), variance(&smoothed));
+        assert!(
+            var_smoothed < var_raw,
+            "reservoir must reduce miner-revenue variance (raw {var_raw:.0} vs smoothed {var_smoothed:.0})"
+        );
+    }
 }
