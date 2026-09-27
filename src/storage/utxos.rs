@@ -348,6 +348,12 @@ impl UtxoSet {
         self.outputs.len()
     }
 
+    /// Number of distinct spent key images (O(1)). Used by the UTXO security
+    /// detail: distinct spends can never exceed outputs ever created.
+    pub fn spent_key_image_count(&self) -> usize {
+        self.key_images.len()
+    }
+
     /// Remove an output (used during block disconnection).
     ///
     /// AUDIT (R-68 fix, 2026-07-03): the pre-fix code removed the
@@ -928,6 +934,21 @@ fn utxo_count_violation(live: u64, ever: u64) -> Option<(&'static str, String)> 
     }
 }
 
+/// Pure double-spend/inflation invariant: the number of distinct SPENT key
+/// images can never exceed the number of outputs ever created — you cannot
+/// spend more outputs than have existed. A violation is key-image-set
+/// corruption or double-spend accounting inflation.
+fn utxo_spend_violation(spent: u64, ever: u64) -> Option<(&'static str, String)> {
+    if spent > ever {
+        Some((
+            "spent-exceeds-ever",
+            format!("distinct spent key images {spent} exceed outputs ever-created {ever}"),
+        ))
+    } else {
+        None
+    }
+}
+
 /// A [`SecurityDetail`](crate::security::SecurityDetail) over the UTXO set — the
 /// chain's core value-integrity surface. Read-only, O(1):
 /// - **Guard (consensus-critical):** live count ≤ ever-created (a count-level
@@ -965,6 +986,11 @@ impl crate::security::SecurityDetail for UtxoSecurityDetail<'_> {
         if let Some((code, msg)) = utxo_count_violation(live, ever) {
             r.raise_consensus("utxo-set", Severity::Critical, code, msg);
         }
+        if let Some((code, msg)) =
+            utxo_spend_violation(self.utxos.spent_key_image_count() as u64, ever)
+        {
+            r.raise_consensus("utxo-set", Severity::Critical, code, msg);
+        }
         if self.utxos.output_count() > self.bloat_warn {
             r.raise_operational(
                 "utxo-set",
@@ -987,10 +1013,12 @@ mod tests {
     fn utxo_count_invariant_and_security_detail() {
         use crate::security::SecurityDetail;
 
-        // Pure invariant: live > ever is a violation; otherwise clean.
+        // Pure invariants: live > ever, and spent > ever, are violations.
         assert!(super::utxo_count_violation(10, 5).is_some());
         assert!(super::utxo_count_violation(5, 10).is_none());
         assert!(super::utxo_count_violation(5, 5).is_none());
+        assert!(super::utxo_spend_violation(10, 5).is_some(), "spending more than ever-created is caught");
+        assert!(super::utxo_spend_violation(3, 10).is_none());
 
         // A real set: add three outputs → live == ever == 3, guard clean.
         let mut set = UtxoSet::new();
