@@ -339,6 +339,36 @@ impl SparkPoolStore {
         self.coins.read().len()
     }
 
+    /// The anchored cover set as `(outpoint, coin bytes, serial_context,
+    /// height)` in canonical cover-index order — coins with `height <=
+    /// anchor_height`. This is exactly the set [`cover_set_at`](Self::cover_set_at)
+    /// resolves (same filter + order), enriched with each coin's serial context
+    /// and outpoint so a REMOTE wallet (which lacks the store) can identify its
+    /// owned coin and build a spend against the identical set the verifier will
+    /// resolve. The position in this `Vec` is the coin's spend index for a proof
+    /// anchored at `(cover_set_id, anchor_height)`. `cover_set_id` is reserved
+    /// for multi-group buckets (accepted and ignored while the pool is one
+    /// monotonic group — mirrors `cover_set_at`).
+    pub fn cover_entries_at(
+        &self,
+        _cover_set_id: u64,
+        anchor_height: u64,
+    ) -> Vec<(Vec<u8>, Vec<u8>, Vec<u8>, u64)> {
+        self.coins
+            .read()
+            .iter()
+            .filter(|c| c.height <= anchor_height)
+            .map(|c| {
+                (
+                    c.outpoint.clone(),
+                    c.coin.0.clone(),
+                    c.serial_context.clone(),
+                    c.height,
+                )
+            })
+            .collect()
+    }
+
     /// Every pool coin as `(outpoint, coin bytes, serial_context, height)` in
     /// cover-set order — what a wallet scan needs to test ownership (via
     /// `SparkBackend::identify` on the coin bytes) and, for owned coins, key the
@@ -658,6 +688,32 @@ mod tests {
         assert_eq!(s.context_for(b"tx1:1").as_deref(), Some(&b"ctx2"[..]));
         assert_eq!(s.coin_at(0).unwrap().outpoint, b"tx1:0");
         assert!(s.index_of(b"nope").is_none());
+    }
+
+    #[test]
+    fn cover_entries_at_filters_by_height_and_preserves_cover_order() {
+        let s = SparkPoolStore::new();
+        s.add_coin(b"op:0".to_vec(), coin(1), b"ctx-a".to_vec(), 5).unwrap();
+        s.add_coin(b"op:1".to_vec(), coin(2), b"ctx-b".to_vec(), 10).unwrap();
+        s.add_coin(b"op:2".to_vec(), coin(3), b"ctx-c".to_vec(), 15).unwrap();
+
+        // Anchor at height 10 → only the first two coins, in cover order.
+        let e = s.cover_entries_at(0, 10);
+        assert_eq!(e.len(), 2, "coin at height 15 is excluded");
+        assert_eq!(e[0].0, b"op:0");
+        assert_eq!(e[0].1, coin(1).0, "coin bytes");
+        assert_eq!(e[0].2, b"ctx-a", "serial context");
+        assert_eq!(e[0].3, 5, "height");
+        assert_eq!(e[1].0, b"op:1");
+        // The same set + order cover_set_at resolves (what the verifier uses).
+        let cs = s.cover_set_at(0, 10);
+        assert_eq!(cs, vec![coin(1), coin(2)]);
+        assert_eq!(e.iter().map(|x| x.1.clone()).collect::<Vec<_>>(), vec![coin(1).0, coin(2).0]);
+
+        // Anchor above every coin → the full set.
+        assert_eq!(s.cover_entries_at(0, 100).len(), 3);
+        // Anchor below every coin → empty.
+        assert!(s.cover_entries_at(0, 1).is_empty());
     }
 
     #[test]

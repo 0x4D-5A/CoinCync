@@ -748,6 +748,24 @@ impl Blockchain {
         v
     }
 
+    /// The anchored shielded (Spark) cover set for a REMOTE wallet: `(outpoint,
+    /// coin, serial_context, height)` per coin, in the canonical order a spend
+    /// proof anchored at `(cover_set_id, anchor_height)` is built and verified
+    /// against. Read-only. Empty when the pool store is absent or holds no coins
+    /// at/under `anchor_height`. Serves the data a wallet needs to identify its
+    /// owned coin and build a shielded spend without holding the pool itself.
+    #[cfg(feature = "sketch-gk-proof")]
+    pub fn spark_pool_cover_entries(
+        &self,
+        cover_set_id: u64,
+        anchor_height: u64,
+    ) -> Vec<(Vec<u8>, Vec<u8>, Vec<u8>, u64)> {
+        self.spark_pool_store
+            .as_ref()
+            .map(|s| s.cover_entries_at(cover_set_id, anchor_height))
+            .unwrap_or_default()
+    }
+
     /// The unified operator security sweep: run every initialized detail —
     /// Phase-2 lock-step (always) and the shielded-pool detail (gated + present)
     /// — under one `SecurityCommand` and return the report. **Pure** (does not
