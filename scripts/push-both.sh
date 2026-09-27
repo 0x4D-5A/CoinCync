@@ -2,14 +2,16 @@
 #
 # push-both.sh — push ONE branch to the project's public home(s).
 #
-#   • PRIMARY  GitHub org   (Coincync/Coincync-Testnet-)   remote: origin
-#   • MIRROR   GitHub user  (ghostrider1092/CoinCync)       remote: mirror
+#   • PRIMARY  GitHub user  (ghostrider1092/CoinCync)     remote: origin
+#   • MIRROR   GitHub org   (Coincync/Coincync-Testnet-)   remote: mirror
 #
-# The primary home moved to the Coincync GitHub org on 2026-09-26 after the
-# org's GitHub block was lifted; the ghostrider1092/CoinCync user repo is kept
-# as a backup mirror. Note org `main` is ruleset-protected (PR review +
-# signed commits + required CI) — this script pushes feature branches; `main`
-# advances only through a reviewed PR.
+# 2026-09-26: primary reverted to the personal account. The Coincync org was
+# flagged by GitHub and HIDDEN FROM PUBLIC (twice now — abuse/ToS detection
+# keeps re-flagging the crypto org), so it is no longer a reliable *public*
+# home. The org repo still works (not disabled) and is kept as a secondary
+# mirror; the unflagged, public personal repo is primary again. Org `main` is
+# ruleset-protected (PR review + signed commits + required CI); the personal
+# repo is not. This script pushes feature branches to both.
 #
 # Codeberg was REMOVED 2026-08-20: Codeberg's usage policy prohibits
 # cryptocurrency/blockchain projects, so it was never a valid home (the old
@@ -28,10 +30,10 @@ set -euo pipefail
 
 branch="${1:?usage: scripts/push-both.sh <branch>}"
 
-echo "→ GitHub org — PRIMARY (Coincync/Coincync-Testnet-) …"
+echo "→ GitHub user — PRIMARY (ghostrider1092/CoinCync) …"
 git push origin "$branch:refs/heads/$branch"
 
-echo "→ GitHub user — mirror (ghostrider1092/CoinCync) …"
+echo "→ GitHub org — mirror (Coincync/Coincync-Testnet-) …"
 git push mirror "$branch:refs/heads/$branch"
 
 # ── Optional third home (a REAL crypto-tolerant forge — NOT Codeberg) ─────────
@@ -43,4 +45,4 @@ git push mirror "$branch:refs/heads/$branch"
 # git push fallback "$branch:refs/heads/$branch"
 # ─────────────────────────────────────────────────────────────────────────────
 
-echo "✓ '$branch' pushed to the GitHub org (primary) + user mirror."
+echo "✓ '$branch' pushed to the GitHub user (primary) + org mirror."
