@@ -4639,11 +4639,16 @@ mod tests {
     #[test]
     #[ignore = "soak: drive with SHIELDED_SOAK_SECS"]
     fn soak_shielded_in_block_consensus() {
-        use crate::consensus::spark_payload::build::{build_mint_payload, build_spend_payload};
+        use crate::consensus::spark_payload::build::{
+            build_mint_payload, build_spend_payload, build_transfer_payload,
+        };
         use crate::consensus::spark_payload::derive_outpoint;
         use crate::storage::spark_pool::SparkPoolStore;
         use crate::transaction::{Transaction, TxType};
-        use spark_connector::ffi::cover_set_size;
+        use spark_connector::ffi::{
+            address_from_seed, cover_set_size, spend_outputs, LibsparkBackend,
+        };
+        use spark_connector::SparkBackend;
         use std::sync::Arc;
         use std::time::{Duration, Instant};
 
@@ -4661,6 +4666,11 @@ mod tests {
         chain.spark_pool_store = Some(Arc::new(SparkPoolStore::new()));
         let store = Arc::clone(chain.spark_pool_store.as_ref().unwrap());
         let n = cover_set_size().expect("cover set size");
+        assert!(n >= 2, "soak needs a cover set of at least 2 coins");
+        // A fixed second wallet: transfer recipient, distinct from the per-cycle
+        // sender seed. Its address is stable across cycles.
+        let recipient_b = b"soak-recipient-B";
+        let addr_b = address_from_seed(recipient_b).expect("recipient B address");
 
         let mk = |extra: Vec<u8>| Transaction {
             version: 1,
@@ -4726,13 +4736,58 @@ mod tests {
             }
             invariants!();
 
-            // ── SPEND a random owned coin (unshield to a transparent output) ──
-            let vout = (rand() as u32) % (n as u32);
-            let owned_op = derive_outpoint(&[], vout);
+            // One checkpoint at h2 covers BOTH the transfer and the self-spend
+            // below; the reorg (rewind 2, then 1) rolls both back to empty.
+            chain.checkpoint_phase2_stores(2);
+
+            // Two DISTINCT owned coins: one transferred to B, one self-spent.
+            // Distinct so the self-spend never re-spends the transfer's input
+            // (which would be a spurious double-spend).
+            let xfer_vout = (rand() as u32) % (n as u32);
+            let spend_vout = (xfer_vout + 1 + (rand() as u32) % (n as u32 - 1)) % (n as u32);
+
+            // ── TRANSFER a coin to wallet B; B must recover it, sender must not ─
+            let xfer_op = derive_outpoint(&[], xfer_vout);
+            let xfer_payload =
+                build_transfer_payload(wseed.as_bytes(), store.as_ref(), &xfer_op, 100, 0, 1, &addr_b)
+                    .unwrap_or_else(|| anomaly!("build_transfer"));
+            let xfer_tx = mk(xfer_payload.encode());
+            if chain.verify_block_spark_v2(std::slice::from_ref(&xfer_tx)).is_err() {
+                anomaly!("valid_transfer_rejected");
+            }
+            let before_xfer = store.coin_count();
+            chain.apply_spark_v2_txs(std::slice::from_ref(&xfer_tx), 2);
+            if store.coin_count() <= before_xfer {
+                anomaly!("transfer_output_not_fed");
+            }
+            {
+                let sb = xfer_payload
+                    .spend
+                    .as_ref()
+                    .unwrap_or_else(|| anomaly!("transfer_no_spend"));
+                let (out_coins, out_ctx) =
+                    spend_outputs(&sb.bundle).unwrap_or_else(|| anomaly!("transfer_spend_outputs"));
+                let backend = LibsparkBackend;
+                let recipient_recovers = out_coins
+                    .iter()
+                    .any(|c| matches!(backend.identify(recipient_b, c, &out_ctx), Ok(Some(_))));
+                if !recipient_recovers {
+                    anomaly!("recipient_cannot_recover_transfer");
+                }
+                let sender_recovers = out_coins
+                    .iter()
+                    .any(|c| matches!(backend.identify(wseed.as_bytes(), c, &out_ctx), Ok(Some(_))));
+                if sender_recovers {
+                    anomaly!("sender_recovered_transfer_output");
+                }
+            }
+            invariants!();
+
+            // ── SPEND a different owned coin (self-spend, change back to self) ─
+            let owned_op = derive_outpoint(&[], spend_vout);
             let spend_payload = build_spend_payload(wseed.as_bytes(), store.as_ref(), &owned_op, 100, 0, 1)
                 .unwrap_or_else(|| anomaly!("build_spend"));
             let spend_tx = mk(spend_payload.encode());
-            chain.checkpoint_phase2_stores(2);
             if chain.verify_block_spark_v2(std::slice::from_ref(&spend_tx)).is_err() {
                 anomaly!("valid_spend_rejected");
             }
@@ -4758,7 +4813,7 @@ mod tests {
         }
 
         eprintln!(
-            "SHIELDED SOAK OK: {cycles} mint/spend/reorg cycles in {secs}s, seed={seed0}"
+            "SHIELDED SOAK OK: {cycles} mint/transfer/spend/reorg cycles in {secs}s, seed={seed0}"
         );
         assert!(cycles > 0, "soak ran zero cycles");
     }
