@@ -299,7 +299,9 @@ pub fn verify_mint_shield_in(mint_bundle: &[u8], value_balance: i64) -> Result<(
 #[cfg(feature = "libspark-ffi")]
 pub mod build {
     use super::*;
-    use spark_connector::ffi::{build_mint_bundle, build_spend_over_set, serial_context};
+    use spark_connector::ffi::{
+        build_mint_bundle, build_spend_over_set, build_spend_to_address, serial_context,
+    };
 
     /// Build an AUTHENTICATED mint-side (shield-in) payload: one libspark
     /// `MintTransaction` over `values`, carrying a per-coin Schnorr value proof
@@ -350,13 +352,68 @@ pub mod build {
         cover_set_id: u64,
         anchor_height: u64,
     ) -> Option<SparkPayload> {
+        build_spend_payload_inner(
+            seed,
+            store,
+            owned_outpoint,
+            output_value,
+            cover_set_id,
+            anchor_height,
+            None,
+        )
+    }
+
+    /// Build a TRANSFER payload: spend the pool coin at `owned_outpoint` and pay
+    /// `output_value` to `recipient_addr` (a bech32m Spark address, as bytes) —
+    /// a shielded→shielded send to another wallet. The output coin re-enters the
+    /// pool at apply and is recoverable by the recipient (fee = input −
+    /// `output_value`, `value_balance = 0` — nothing crosses the veil). `None`
+    /// if the coin is not in the anchored cover set, the recipient is empty, or
+    /// the FFI fails.
+    pub fn build_transfer_payload(
+        seed: &[u8],
+        store: &SparkPoolStore,
+        owned_outpoint: &[u8],
+        output_value: u64,
+        cover_set_id: u64,
+        anchor_height: u64,
+        recipient_addr: &[u8],
+    ) -> Option<SparkPayload> {
+        if recipient_addr.is_empty() {
+            return None;
+        }
+        build_spend_payload_inner(
+            seed,
+            store,
+            owned_outpoint,
+            output_value,
+            cover_set_id,
+            anchor_height,
+            Some(recipient_addr),
+        )
+    }
+
+    /// Shared spend/transfer builder. `recipient_addr = None` → self-spend
+    /// (change back to the spender); `Some(addr)` → transfer to that address.
+    fn build_spend_payload_inner(
+        seed: &[u8],
+        store: &SparkPoolStore,
+        owned_outpoint: &[u8],
+        output_value: u64,
+        cover_set_id: u64,
+        anchor_height: u64,
+        recipient_addr: Option<&[u8]>,
+    ) -> Option<SparkPayload> {
         let cover = store.cover_set_at(cover_set_id, anchor_height);
         let ctx = store.context_for(owned_outpoint)?;
         let idx = store.index_of(owned_outpoint)? as usize;
         if idx >= cover.len() {
             return None; // owned coin not inside the anchored cover set
         }
-        let bundle = build_spend_over_set(seed, &cover, idx, &ctx, output_value)?;
+        let bundle = match recipient_addr {
+            Some(addr) => build_spend_to_address(seed, &cover, idx, &ctx, output_value, addr)?,
+            None => build_spend_over_set(seed, &cover, idx, &ctx, output_value)?,
+        };
         Some(SparkPayload {
             version: SPARK_PAYLOAD_VERSION,
             mint: None,

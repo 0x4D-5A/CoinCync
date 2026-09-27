@@ -224,6 +224,8 @@ pub mod ffi {
             ctx_ptr: *const u8,
             ctx_len: c_int,
             output_value: u64,
+            recip_addr_ptr: *const u8,
+            recip_addr_len: c_int,
             out: *mut u8,
             cap: c_int,
         ) -> c_int;
@@ -526,16 +528,49 @@ pub mod ffi {
 
     /// Build a shielded spend over a CALLER-SUPPLIED `cover_set`, spending the
     /// coin the `seed` wallet owns at `spend_index` (minted with `context`) and
-    /// paying `output_value` back to the wallet. Returns the verify bundle
-    /// [`SpendBytes`] (what [`LibsparkBackend::verify_spend`] consumes), or
-    /// `None` on error. The cover set marshals as
-    /// `[u32 count][ (u32 len)(coin bytes) ]...`.
+    /// paying `output_value` back to the WALLET (a change/consolidation
+    /// self-spend). Returns the verify bundle [`SpendBytes`] (what
+    /// [`LibsparkBackend::verify_spend`] consumes), or `None` on error. The cover
+    /// set marshals as `[u32 count][ (u32 len)(coin bytes) ]...`.
     pub fn build_spend_over_set(
         seed: &[u8],
         cover_set: &[CoinBytes],
         spend_index: usize,
         context: &[u8],
         output_value: u64,
+    ) -> Option<SpendBytes> {
+        // Empty recipient → the shim pays the output back to the spender.
+        build_spend_inner(seed, cover_set, spend_index, context, output_value, &[])
+    }
+
+    /// Build a shielded spend that pays `output_value` to `recipient_addr` (a
+    /// bech32m Spark address, as bytes) — a shielded→shielded TRANSFER to another
+    /// wallet. The spend consumes the spender's owned coin at `spend_index`; its
+    /// output coin re-enters the pool and is recoverable/spendable by the
+    /// recipient (fee = input − `output_value`). Returns the verify bundle, or
+    /// `None` on error (bad index, `output_value` ∉ (0, input), bad address, …).
+    pub fn build_spend_to_address(
+        seed: &[u8],
+        cover_set: &[CoinBytes],
+        spend_index: usize,
+        context: &[u8],
+        output_value: u64,
+        recipient_addr: &[u8],
+    ) -> Option<SpendBytes> {
+        if recipient_addr.is_empty() {
+            return None; // a transfer must name a recipient
+        }
+        build_spend_inner(seed, cover_set, spend_index, context, output_value, recipient_addr)
+    }
+
+    /// Shared spend builder: `recipient_addr` empty → self-spend, else transfer.
+    fn build_spend_inner(
+        seed: &[u8],
+        cover_set: &[CoinBytes],
+        spend_index: usize,
+        context: &[u8],
+        output_value: u64,
+        recipient_addr: &[u8],
     ) -> Option<SpendBytes> {
         // Marshal the cover set: [u32 count][ (u32 len)(bytes) ]...
         let mut set = Vec::with_capacity(4 + cover_set.iter().map(|c| 4 + c.0.len()).sum::<usize>());
@@ -556,6 +591,8 @@ pub mod ffi {
                 context.as_ptr(),
                 context.len() as c_int,
                 output_value,
+                recipient_addr.as_ptr(),
+                recipient_addr.len() as c_int,
                 out.as_mut_ptr(),
                 out.len() as c_int,
             )
@@ -847,6 +884,63 @@ pub mod ffi {
                 .expect("caller-set spend must verify");
             assert_eq!(tags.len(), 1, "one input => one nullifier tag");
             assert_eq!(tags[0].0.len(), 34, "tag is a 34-byte group element");
+        }
+
+        #[test]
+        fn transfer_pays_recipient_who_recovers_the_output_coin() {
+            // Shielded→shielded TRANSFER: A spends an owned coin to B's address.
+            // The spend's output coin must be recoverable by B (and NOT by A) —
+            // the property that makes a real send (vs. a self-spend) work.
+            let a = b"sender-seed-A";
+            let b_seed = b"recipient-seed-B";
+            let addr_b = address_from_seed(b_seed).expect("B's address");
+            let n = cover_set_size().expect("cover set size");
+
+            // A mints its cover set (owns every coin).
+            let mut coins = Vec::with_capacity(n);
+            let mut ctxs = Vec::with_capacity(n);
+            for i in 0..n {
+                let mut ctx = [0u8; 32];
+                ctx[0] = i as u8;
+                ctx[1] = 0xa5;
+                coins.push(mint_to_seed(a, 5_000 + i as u64, &ctx).expect("mint"));
+                ctxs.push(ctx.to_vec());
+            }
+
+            // A spends its coin at index 2 (value 5002), paying 3_000 to B (fee 2002).
+            let spend_index = 2usize;
+            let bundle =
+                build_spend_to_address(a, &coins, spend_index, &ctxs[spend_index], 3_000, &addr_b)
+                    .expect("build transfer to B");
+
+            let backend = LibsparkBackend;
+            let tags = backend.verify_spend(&[], &bundle, 0, 0).expect("transfer verifies");
+            assert_eq!(tags.len(), 1, "one input → one nullifier");
+
+            // The output coin re-enters the pool with its recoverable context.
+            let (out_coins, out_ctx) = spend_outputs(&bundle.0).expect("extract spend outputs");
+            assert_eq!(out_coins.len(), 1, "one payment output");
+
+            // B recovers the 3_000 coin; A cannot see it (it is not A's).
+            let recovered = backend
+                .identify(b_seed, &out_coins[0], &out_ctx)
+                .expect("identify call")
+                .expect("B owns the transfer output");
+            assert_eq!(recovered.value, 3_000, "B receives the transferred value");
+            assert!(
+                backend.identify(a, &out_coins[0], &out_ctx).unwrap().is_none(),
+                "the sender must NOT be able to recover a coin paid to the recipient"
+            );
+
+            // A self-spend (no recipient) still pays A: identify with A succeeds.
+            let self_bundle =
+                build_spend_over_set(a, &coins, spend_index, &ctxs[spend_index], 3_000)
+                    .expect("self-spend builds");
+            let (self_out, self_ctx) = spend_outputs(&self_bundle.0).expect("self outputs");
+            assert!(
+                backend.identify(a, &self_out[0], &self_ctx).unwrap().is_some(),
+                "a self-spend's change is recoverable by the spender"
+            );
         }
 
         #[test]

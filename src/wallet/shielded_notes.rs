@@ -22,7 +22,7 @@
 use spark_connector::ffi::LibsparkBackend;
 use spark_connector::{CoinBytes, SparkBackend};
 
-use crate::consensus::spark_payload::build::build_spend_payload;
+use crate::consensus::spark_payload::build::{build_spend_payload, build_transfer_payload};
 use crate::consensus::spark_payload::SparkPayload;
 use crate::storage::spark_pool::SparkPoolStore;
 
@@ -167,6 +167,47 @@ impl ShieldedNoteStore {
         self.mark_spent(&chosen);
         Some(payload)
     }
+
+    /// Build a consensus-verifiable shielded TRANSFER paying `output_value` to
+    /// `recipient_addr` (a bech32m Spark address, as bytes) and mark the funding
+    /// note spent.
+    ///
+    /// Same note-selection as [`ShieldedNoteStore::build_self_spend`] (smallest
+    /// unspent note strictly greater than `output_value`, for a positive fee),
+    /// but the output coin is paid to the recipient. Once applied, that coin
+    /// re-enters the pool and the recipient recovers it by scanning. Returns the
+    /// [`SparkPayload`], or `None` if no single note covers `output_value`, the
+    /// recipient is empty, or the build fails (nothing is marked on failure).
+    pub fn build_transfer(
+        &mut self,
+        seed: &[u8],
+        pool: &SparkPoolStore,
+        recipient_addr: &[u8],
+        output_value: u64,
+        cover_set_id: u64,
+        anchor_height: u64,
+    ) -> Option<SparkPayload> {
+        if recipient_addr.is_empty() {
+            return None;
+        }
+        let chosen = self
+            .unspent()
+            .filter(|n| n.value > output_value)
+            .min_by_key(|n| n.value)?
+            .outpoint
+            .clone();
+        let payload = build_transfer_payload(
+            seed,
+            pool,
+            &chosen,
+            output_value,
+            cover_set_id,
+            anchor_height,
+            recipient_addr,
+        )?;
+        self.mark_spent(&chosen);
+        Some(payload)
+    }
 }
 
 #[cfg(test)]
@@ -259,5 +300,55 @@ mod tests {
 
         // 1_000 note cannot cover a 1_500 output (needs value strictly greater).
         assert!(store.build_self_spend(seed, &pool, 1_500, 0, 1).is_none());
+    }
+
+    #[test]
+    fn build_transfer_sends_to_recipient_who_scans_it_from_the_pool() {
+        use crate::consensus::spark_payload::verify_spark_payload;
+        use spark_connector::ffi::{address_from_seed, spend_outputs};
+
+        let pool = SparkPoolStore::new();
+        let seed_a = b"transfer-sender-A";
+        let seed_b = b"transfer-recipient-B";
+        let addr_b = address_from_seed(seed_b).expect("B's address");
+
+        // A owns three pool coins.
+        mint_to_pool(&pool, seed_a, &[1_000, 2_000, 3_000]);
+        let mut a = ShieldedNoteStore::new();
+        assert_eq!(a.scan(seed_a, &pool), 3);
+        assert_eq!(a.balance(), 6_000);
+
+        // A sends 1_500 to B → funded by the 2_000 note (fee 500).
+        let payload = a
+            .build_transfer(seed_a, &pool, &addr_b, 1_500, 0, 1)
+            .expect("transfer builds");
+        assert!(payload.spend.is_some());
+        assert_eq!(a.balance(), 4_000, "A's funding note is spent");
+
+        // The node verifies the transfer.
+        let backend = LibsparkBackend;
+        let tags = verify_spark_payload(&pool, &backend, &payload, 0).expect("node verifies");
+        assert_eq!(tags.len(), 1);
+
+        // Feed the spend's output coin into the pool, exactly as the chain's
+        // apply hook does (keyed by a per-coin id, recoverable serial context).
+        let sb = payload.spend.as_ref().unwrap();
+        let (out_coins, out_ctx) = spend_outputs(&sb.bundle).expect("extract outputs");
+        for coin in &out_coins {
+            let key = blake3::hash(&coin.0).as_bytes().to_vec();
+            assert!(pool.add_coin(key, coin.clone(), out_ctx.clone(), 2).is_some());
+        }
+
+        // B scans the pool and finds exactly the 1_500 coin A sent.
+        let mut b = ShieldedNoteStore::new();
+        let found = b.scan(seed_b, &pool);
+        assert_eq!(found, 1, "B owns exactly the transferred coin");
+        assert_eq!(b.balance(), 1_500, "B receives the sent value");
+
+        // A does NOT see the coin it sent away (re-scan finds nothing new).
+        assert_eq!(a.scan(seed_a, &pool), 0, "the sent coin is not A's");
+
+        // An empty recipient is rejected.
+        assert!(a.build_transfer(seed_a, &pool, &[], 500, 0, 1).is_none());
     }
 }

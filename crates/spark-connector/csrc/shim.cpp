@@ -619,11 +619,18 @@ int spark_ffi_mint_to_seed(const unsigned char* seed, int seed_len, uint64_t val
 // spend paying `output_value` back to the wallet (fee = input − output), and
 // packs the same verify bundle `spark_ffi_verify_bundle` consumes. Returns the
 // bundle length, or -1 on error (bad index, output_value ∉ (0, input), …).
+//
+// The output coin is paid to `recip_addr` (a bech32m Spark address) when
+// `recip_addr_len > 0` — a shielded→shielded TRANSFER to another wallet — else
+// back to the spender's own address (a change/consolidation self-spend). The
+// output coin re-enters the pool (see spark_ffi_spend_outputs); the recipient
+// recovers it by scanning with the same serial context the pool stores.
 int spark_ffi_build_spend_over_set(const unsigned char* seed, int seed_len,
                                    const unsigned char* set_ptr, int set_len,
                                    uint64_t spend_index,
                                    const unsigned char* ctx_ptr, int ctx_len,
                                    uint64_t output_value,
+                                   const unsigned char* recip_addr_ptr, int recip_addr_len,
                                    unsigned char* out, int cap) {
     try {
         const spark::Params* params = spark::Params::get_test();
@@ -694,7 +701,13 @@ int spark_ffi_build_spend_over_set(const unsigned char* seed, int seed_len,
         cover_sets[cover_set_id] = cover_set;
 
         const uint64_t fee = id.v - output_value;
+        // Pay the output to the recipient's address (transfer) or back to the
+        // spender (self-spend) when no recipient is supplied.
         spark::Address address(incoming_view_key, 0);
+        if (recip_addr_len > 0) {
+            std::string addr_str((const char*)recip_addr_ptr, (std::size_t)recip_addr_len);
+            address.decode(addr_str);
+        }
         std::vector<spark::OutputCoinData> out_coin_data;
         out_coin_data.emplace_back();
         out_coin_data.back().address = address;
