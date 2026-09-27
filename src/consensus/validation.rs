@@ -365,7 +365,7 @@ pub fn validate_block_ctx(
     // Every current producer writes zero (genesis included), so this rejects no
     // existing block. When shielded activates, the root is instead bound to the
     // post-apply accumulator state (see chain.rs / CIP Increment 2c#3b).
-    if !shielded_root_permitted(&block.header.spark_set_root, block.height()) {
+    if !shielded_root_permitted(&block.header.spark_set_root, expected_network, block.height()) {
         result.add_error(format!(
             "spark_set_root must be zero while shielded transactions are inactive \
              (non-zero at height {})",
@@ -1524,7 +1524,7 @@ pub(crate) fn validate_transaction_for_network_ctx(
     // path is fail-closed and gated by SHIELDED_TX_ACTIVATION_HEIGHT — see
     // check_shielded_tx and docs/design/cip-shielded-txtype.md.
     if tx.is_shielded() {
-        return check_shielded_tx(tx, current_height);
+        return check_shielded_tx(tx, expected_network, current_height);
     }
 
     check_tx_v2_activation(tx, current_height)?;
@@ -1555,8 +1555,12 @@ pub(crate) fn validate_transaction_for_network_ctx(
 /// `spark_set_root` must be zero (it only carries the accumulator root once
 /// shielded activates). Pure predicate for the block gate in
 /// `validate_block_ctx`.
-fn shielded_root_permitted(spark_set_root: &[u8; 32], height: u64) -> bool {
-    crate::constants::shielded_tx_active_at_height(height) || *spark_set_root == [0u8; 32]
+fn shielded_root_permitted(
+    spark_set_root: &[u8; 32],
+    network: crate::config::NetworkType,
+    height: u64,
+) -> bool {
+    crate::constants::shielded_tx_active_at_height(network, height) || *spark_set_root == [0u8; 32]
 }
 
 /// Validate a shielded (Lelantus-Spark) transaction — CIP-Shielded.
@@ -1572,18 +1576,36 @@ fn shielded_root_permitted(spark_set_root: &[u8; 32], height: u64) -> bool {
 ///
 /// This double gate means a shielded tx can never enter a block on any current
 /// build, while the consensus dispatch/apply structure is in place and tested.
-fn check_shielded_tx(tx: &Transaction, current_height: u64) -> Result<()> {
+fn check_shielded_tx(
+    tx: &Transaction,
+    network: crate::config::NetworkType,
+    current_height: u64,
+) -> Result<()> {
     debug_assert!(tx.is_shielded());
-    if !crate::constants::shielded_tx_active_at_height(current_height) {
+    if !crate::constants::shielded_tx_active_at_height(network, current_height) {
         return Err(Error::InvalidTransaction(
             "shielded (Spark) transactions are not activated at this height".to_string(),
         ));
     }
-    // Stateless structural check: the shielded payload in `tx.extra` must be a
-    // well-formed, current-version ShieldedPayload. (Decode rejects malformed or
-    // wrong-version bytes.) The stateful serial-tag double-spend + accumulator
-    // append happen at block-apply against the ShieldedStore — see
-    // consensus::shielded::apply_shielded_payload.
+
+    // v2 (SparkPayload — the canonical libspark-aligned format): STATELESS
+    // structural routing only. The full verify is STATEFUL — cover set + pool
+    // value + per-tx mint/spend proofs — and runs at block level in
+    // `chain.rs::verify_block_spark_v2` (which holds the SparkPoolStore and
+    // rejects the whole block on any fault; that is the authoritative gate).
+    // Here we only confirm the payload decodes as a current-version SparkPayload:
+    // a malformed v2 tx is rejected now, a well-formed one is admitted to face
+    // the block-level verify.
+    #[cfg(all(feature = "sketch-gk-proof", feature = "libspark-ffi"))]
+    if crate::consensus::spark_payload::SparkPayload::decode(&tx.extra).is_ok() {
+        return Ok(());
+    }
+
+    // v1 (ShieldedPayload — the legacy native-GK engine, see
+    // cip-shielded-one-pool-consolidation.md). Stateless structural check: the
+    // payload in `tx.extra` must be a well-formed, current-version
+    // ShieldedPayload. The stateful serial-tag double-spend + accumulator append
+    // happen at block-apply against the ShieldedStore.
     let payload = crate::consensus::shielded::ShieldedPayload::decode(&tx.extra)?;
     // ── ACTIVATION SLOT ───────────────────────────────────────────────────
     // Route through the shielded connector (its own crate). Under the
@@ -4665,15 +4687,61 @@ mod tests {
         );
     }
 
+    /// Increment #3: regtest gets a finite shielded activation height, and a v2
+    /// `SparkPayload` is routed statelessly (structural admit → the authoritative
+    /// stateful verify runs at block level). Testnet/mainnet stay permanently off.
+    #[cfg(all(feature = "sketch-gk-proof", feature = "libspark-ffi"))]
+    #[test]
+    fn regtest_activates_shielded_and_routes_v2_payload_statelessly() {
+        use crate::config::NetworkType::{Regtest, Testnet};
+        use crate::constants::SHIELDED_REGTEST_ACTIVATION_HEIGHT as ACT;
+
+        // A real authenticated v2 SparkPayload (mint / shield-in).
+        let (payload, _) =
+            crate::consensus::spark_payload::build::build_mint_payload(b"regtest-act-seed", &[10_000u64, 20_000], &[])
+                .expect("build v2 mint payload");
+        let mut tx = coinbase_tx(vec![a_valid_output()]);
+        tx.tx_type = TxType::Shielded; // not coinbase → reaches check_shielded_tx
+        tx.extra = payload.encode();
+        let utxos = UtxoSet::new();
+
+        // Regtest at/after activation: the stateless gate ADMITS the well-formed
+        // v2 payload (structural); the full stateful verify runs at block level.
+        assert!(
+            validate_transaction_for_network_ctx(&tx, &utxos, ACT, Regtest, false).is_ok(),
+            "regtest at activation must admit a well-formed v2 shielded tx"
+        );
+        // Regtest BELOW activation: rejected (not activated).
+        assert!(
+            validate_transaction_for_network_ctx(&tx, &utxos, ACT - 1, Regtest, false).is_err(),
+            "regtest below activation must reject the shielded tx"
+        );
+        // Testnet: shielded is inactive at every REALISTIC height (activation is
+        // u64::MAX — the unreachable sentinel; a real chain never reaches it).
+        assert!(
+            validate_transaction_for_network_ctx(&tx, &utxos, 1_000_000_000, Testnet, false).is_err(),
+            "testnet must not activate shielded at any reachable height"
+        );
+        // A malformed payload is rejected even on regtest at activation.
+        tx.extra = vec![0xFFu8; 4];
+        assert!(
+            validate_transaction_for_network_ctx(&tx, &utxos, ACT, Regtest, false).is_err(),
+            "a malformed shielded payload must be rejected"
+        );
+    }
+
     #[test]
     fn shielded_root_gate_requires_zero_while_inactive() {
+        // Testnet is permanently inactive (u64::MAX) in every build, so it
+        // exercises the "while inactive" gate stably.
+        use crate::config::NetworkType::Testnet as N;
         // Zero root is always permitted.
-        assert!(shielded_root_permitted(&[0u8; 32], 0));
-        assert!(shielded_root_permitted(&[0u8; 32], 100_000));
+        assert!(shielded_root_permitted(&[0u8; 32], N, 0));
+        assert!(shielded_root_permitted(&[0u8; 32], N, 100_000));
         // A non-zero root is rejected while shielded is inactive (the current,
         // permanently-disabled state) — at genesis and at any height.
-        assert!(!shielded_root_permitted(&[1u8; 32], 0));
-        assert!(!shielded_root_permitted(&[9u8; 32], 123_456));
+        assert!(!shielded_root_permitted(&[1u8; 32], N, 0));
+        assert!(!shielded_root_permitted(&[9u8; 32], N, 123_456));
     }
 
     // ── validate_transaction_basic granular gates ───────────────────────
