@@ -440,6 +440,17 @@ impl SparkStore {
     pub fn current_root(&self) -> [u8; 32] {
         *self.root.read()
     }
+
+    /// Independently recompute the accumulator root from the retained coin
+    /// vector, bypassing the cached [`current_root`](Self::current_root). Equal
+    /// to `current_root()` for an honest store; a mismatch means the cached
+    /// root drifted from the coins it summarizes (a maintenance bug, a partial
+    /// rewind that truncated the coins without recomputing the root, or memory
+    /// corruption). Used by the Phase-2 root-integrity guard. O(n) in the coin
+    /// count — run off the block-apply hot path.
+    pub fn recomputed_root(&self) -> [u8; 32] {
+        Self::compute_root(&self.coins.read())
+    }
 }
 
 impl Default for SparkStore {

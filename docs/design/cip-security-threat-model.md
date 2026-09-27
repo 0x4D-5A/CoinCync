@@ -52,9 +52,21 @@ re-verify cryptography.
 ### phase2-lockstep
 - **Catches:** the shielded / spark / kernel accumulator stores' checkpoint
   stacks diverging (a reorg would then unwind them to different heights and
-  diverge state) → halt.
-- **Does NOT catch:** corruption *within* a store that keeps the stack depths
-  aligned; wrong accumulator *contents* (only stack-depth agreement is checked).
+  diverge state) → halt. **Root integrity** (added 2026-09-26,
+  `phase2-root-integrity` detail): for each store that can independently
+  recompute its root from retained contents (**kernel**, **spark**), the
+  maintained cached root is reconciled against a fresh recompute
+  (`check_root_integrity`) → operational/Critical (pages, never halts). This
+  closes the "wrong accumulator *contents* while stack depths stay aligned" gap:
+  a cached root that drifted from its contents (maintenance bug, partial rewind,
+  corruption) is now surfaced live via `get_pool_security`.
+- **Does NOT catch:** the **shielded** store's contents — its `BridgeTree` state
+  *is* the accumulator, so there is no cheap independent recompute
+  (`recompute_root()` → `None`, skipped); its integrity rests on validation's
+  committed-root check + replay-on-open. The root-integrity check is O(Σ
+  contents), so it is operational (off the block hot path), not a per-block
+  consensus halt — the O(1) upgrade is reconciling each store root against the
+  committed **header** root (`mw_kernel_root` / `spark_set_root`) every block.
 
 ### shielded-pool
 - **Catches (halt):** coins/tags dated above tip (`coin/tag-from-future`);

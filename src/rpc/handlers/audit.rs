@@ -549,6 +549,10 @@ pub(super) fn register(module: &mut RpcModule<RpcState>) -> Result<()> {
             let mut live = state.chain.security_sweep(state.chain.height());
             live.merge(state.chain.utxo_security());
             live.merge(state.chain.supply_security());
+            // Phase-2 root integrity: recompute each accumulator store's root
+            // from its contents and flag drift (operational). O(Σ contents), so
+            // merged here in the audit path, never on the per-block hot path.
+            live.merge(state.chain.phase2_root_integrity());
             {
                 use crate::security::SecurityDetail;
                 let mp = state.mempool.read();

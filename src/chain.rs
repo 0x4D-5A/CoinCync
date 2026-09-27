@@ -747,6 +747,24 @@ impl Blockchain {
         SecurityCommand::sweep_all(&details)
     }
 
+    /// The Phase-2 **root-integrity** detail's report: for each accumulator
+    /// store that can independently recompute its root (kernel, spark), compare
+    /// the maintained root against a fresh recompute from its retained contents
+    /// and flag any drift (operational/Critical — pages, never halts). This is
+    /// the content-corruption counterpart to the lock-step check in
+    /// [`security_sweep`](Self::security_sweep), which only compares
+    /// checkpoint-stack depths.
+    ///
+    /// Kept SEPARATE from `security_sweep` because the recompute is O(Σ
+    /// contents): it is safe for an operator/audit RPC but MUST NOT run on the
+    /// per-block hot path. Lock-free (reads the `Arc` store fields, not `inner`),
+    /// so it does not deadlock against block-apply. Pure (no incident-log write).
+    pub fn phase2_root_integrity(&self) -> crate::security::SecurityReport {
+        use crate::security::SecurityDetail;
+        let phase2 = self.phase2_stores();
+        crate::storage::phase2::Phase2RootIntegrityDetail::new(&phase2).sweep()
+    }
+
     /// The UTXO-set security detail's report. Kept SEPARATE from
     /// [`security_sweep`](Self::security_sweep) because it acquires the `inner`
     /// read lock: it is safe to call from a path that does NOT already hold

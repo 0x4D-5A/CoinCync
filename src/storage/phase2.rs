@@ -32,8 +32,23 @@ pub trait Phase2Store: Send + Sync {
     /// empty store (benign `rewind`==false) from a non-empty one (a real
     /// inconsistency) in diagnostics.
     fn element_count(&self) -> usize;
-    /// Current accumulator root.
+    /// Current accumulator root (the incrementally-maintained cached value).
     fn current_root(&self) -> [u8; 32];
+    /// Independently recompute the accumulator root **from the store's retained
+    /// contents**, bypassing the incrementally-maintained cached root. Returns
+    /// `None` when the store cannot cheaply recompute — e.g. a `BridgeTree`
+    /// whose live state IS the tree (an independent recompute would mean
+    /// replaying every leaf into a fresh tree). Used by
+    /// [`check_root_integrity`] to catch a cached root that drifted from the
+    /// contents it is supposed to summarize (a maintenance bug, a partial
+    /// rewind, or memory corruption) — the "wrong accumulator contents while
+    /// stack depths stay aligned" gap that [`check_lockstep`] cannot see.
+    ///
+    /// O(n) in the retained contents, so callers run it OFF the block-apply hot
+    /// path (operator/audit only), never as a per-block consensus guard.
+    fn recompute_root(&self) -> Option<[u8; 32]> {
+        None
+    }
 }
 
 impl Phase2Store for ShieldedStore {
@@ -76,6 +91,11 @@ impl Phase2Store for SparkStore {
     fn current_root(&self) -> [u8; 32] {
         self.current_root()
     }
+    fn recompute_root(&self) -> Option<[u8; 32]> {
+        // SparkStore retains the full coin vector, so the root can be
+        // recomputed from scratch and compared to the maintained one.
+        Some(self.recomputed_root())
+    }
 }
 
 impl Phase2Store for KernelStore {
@@ -96,6 +116,11 @@ impl Phase2Store for KernelStore {
     }
     fn current_root(&self) -> [u8; 32] {
         self.current_root()
+    }
+    fn recompute_root(&self) -> Option<[u8; 32]> {
+        // KernelStore retains the full kernel vector, so the root can be
+        // recomputed from scratch and compared to the maintained one.
+        Some(self.recomputed_root())
     }
 }
 
@@ -137,6 +162,50 @@ pub fn check_lockstep(stores: &[&dyn Phase2Store], height: u64) -> Result<usize,
         }
     }
     Ok(depth)
+}
+
+/// Verify every store's incrementally-maintained root matches an independent
+/// recompute from its retained contents. Pure (no mutation). Stores that cannot
+/// cheaply recompute (`recompute_root() == None`, e.g. the `BridgeTree`-backed
+/// `ShieldedStore`) are skipped — this checks only what it can independently
+/// derive. Returns `Err(diagnostic)` naming each store whose cached root drifted
+/// from its contents; `Ok(())` when every checkable store agrees.
+///
+/// This closes the `phase2-lockstep` "wrong accumulator *contents* while stack
+/// depths stay aligned" gap: [`check_lockstep`] only compares checkpoint-stack
+/// depths, so a store whose root drifted from its own contents (without a depth
+/// change) is invisible to it. O(Σ contents) — run off the block-apply hot path.
+pub fn check_root_integrity(stores: &[&dyn Phase2Store]) -> Result<(), String> {
+    fn short(root: &[u8; 32]) -> String {
+        // First 4 bytes are enough to disambiguate in an alert message.
+        format!("{:02x}{:02x}{:02x}{:02x}", root[0], root[1], root[2], root[3])
+    }
+    let mut mismatches: Vec<String> = Vec::new();
+    for s in stores {
+        if let Some(recomputed) = s.recompute_root() {
+            let maintained = s.current_root();
+            if recomputed != maintained {
+                mismatches.push(format!(
+                    "{}: maintained={} recomputed={}",
+                    s.store_label(),
+                    short(&maintained),
+                    short(&recomputed),
+                ));
+            }
+        }
+    }
+    if mismatches.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "Phase-2 accumulator root drift: [{}] — a store's maintained root \
+             disagrees with a fresh recompute from its retained contents, meaning \
+             the cached root and the contents it summarizes have diverged \
+             (maintenance bug, partial rewind, or corruption). The committed \
+             header root would then not match the store's true contents.",
+            mismatches.join("; ")
+        ))
+    }
 }
 
 /// The outcome of rewinding one store during a reorg — surfaced so the caller
@@ -188,6 +257,50 @@ impl crate::security::SecurityDetail for Phase2LockstepDetail<'_> {
     }
 }
 
+/// A [`SecurityDetail`](crate::security::SecurityDetail) over the Phase-2
+/// accumulator stores' **root integrity**: it flags a store whose maintained
+/// root drifted from an independent recompute of its retained contents (see
+/// [`check_root_integrity`]). This is the content-corruption counterpart to
+/// [`Phase2LockstepDetail`] (which only checks checkpoint-stack depth).
+///
+/// Classified **operational** (Critical severity — pages, never halts): the
+/// recompute is O(Σ contents), so it runs off the block-apply hot path
+/// (operator/audit RPC), and — like the supply-schedule reconciliation — it is
+/// defense-in-depth over per-block validation, surfaced loudly rather than
+/// wedging the chain. Promoting it to a consensus halt would require an O(1)
+/// check (e.g. reconciling against the committed header root each block).
+pub struct Phase2RootIntegrityDetail<'a> {
+    stores: &'a [&'a dyn Phase2Store],
+}
+
+impl<'a> Phase2RootIntegrityDetail<'a> {
+    pub fn new(stores: &'a [&'a dyn Phase2Store]) -> Self {
+        Self { stores }
+    }
+}
+
+impl crate::security::SecurityDetail for Phase2RootIntegrityDetail<'_> {
+    fn label(&self) -> &'static str {
+        "phase2-root-integrity"
+    }
+
+    fn sweep(&self) -> crate::security::SecurityReport {
+        use crate::security::{SecurityReport, Severity};
+        let mut r = SecurityReport::clean();
+        if let Err(msg) = check_root_integrity(self.stores) {
+            // Operational (Critical): loud page, never a halt — the recompute is
+            // O(n) and off the consensus path.
+            r.raise_operational(
+                "phase2-root-integrity",
+                Severity::Critical,
+                "root-drift",
+                msg,
+            );
+        }
+        r
+    }
+}
+
 /// Rewind every store by one checkpoint (disconnect one block), classifying each
 /// result. Pure over the slice + the stores' own state; the caller does the
 /// logging so this stays testable.
@@ -223,6 +336,11 @@ mod tests {
         elements: AtomicUsize,
         stack: parking_lot::Mutex<Vec<usize>>,
         skip_next_checkpoint: parking_lot::Mutex<bool>,
+        /// When `Some`, `current_root` returns this instead of the
+        /// contents-derived root — simulates a cached root that drifted from
+        /// the store's contents (the exact corruption the root-integrity guard
+        /// catches). `recompute_root` always returns the contents-derived root.
+        maintained_override: parking_lot::Mutex<Option<[u8; 32]>>,
     }
     impl MockStore {
         fn new(label: &'static str) -> Self {
@@ -231,10 +349,21 @@ mod tests {
                 elements: AtomicUsize::new(0),
                 stack: parking_lot::Mutex::new(Vec::new()),
                 skip_next_checkpoint: parking_lot::Mutex::new(false),
+                maintained_override: parking_lot::Mutex::new(None),
             }
         }
         fn add_element(&self) {
             self.elements.fetch_add(1, Ordering::Relaxed);
+        }
+        /// The honest root derived from the store's live contents.
+        fn contents_root(&self) -> [u8; 32] {
+            (self.element_count() as u64).to_le_bytes().repeat(4)[..32]
+                .try_into()
+                .unwrap()
+        }
+        /// Corrupt the maintained (cached) root so it drifts from the contents.
+        fn corrupt_maintained_root(&self, root: [u8; 32]) {
+            *self.maintained_override.lock() = Some(root);
         }
     }
     impl Phase2Store for MockStore {
@@ -265,9 +394,14 @@ mod tests {
             self.elements.load(Ordering::Relaxed)
         }
         fn current_root(&self) -> [u8; 32] {
-            (self.element_count() as u64).to_le_bytes().repeat(4)[..32]
-                .try_into()
-                .unwrap()
+            let override_root = *self.maintained_override.lock();
+            match override_root {
+                Some(r) => r,
+                None => self.contents_root(),
+            }
+        }
+        fn recompute_root(&self) -> Option<[u8; 32]> {
+            Some(self.contents_root())
         }
     }
 
@@ -374,6 +508,89 @@ mod tests {
         let report = SecurityCommand::assert_consensus_safe(&details2).unwrap_err();
         assert!(report.has_consensus_halt());
         assert!(report.criticals().any(|al| al.code == "store-desync"));
+    }
+
+    #[test]
+    fn root_integrity_clean_when_maintained_matches_contents() {
+        let a = MockStore::new("a");
+        let b = MockStore::new("b");
+        a.add_element();
+        b.add_element();
+        b.add_element();
+        let stores: [&dyn Phase2Store; 2] = [&a, &b];
+        // No override → maintained root == contents root for both.
+        assert!(check_root_integrity(&stores).is_ok(), "honest stores must agree");
+    }
+
+    #[test]
+    fn root_integrity_flags_a_drifted_cached_root() {
+        let a = MockStore::new("a");
+        let b = MockStore::new("b");
+        a.add_element();
+        b.add_element();
+        // Corrupt b's maintained root so it drifts from its contents.
+        b.corrupt_maintained_root([0xAB; 32]);
+        let stores: [&dyn Phase2Store; 2] = [&a, &b];
+        let err = check_root_integrity(&stores).unwrap_err();
+        assert!(err.contains("root drift"), "got: {err}");
+        assert!(err.contains("b:"), "must name the drifted store: {err}");
+        assert!(!err.contains("a:"), "must not implicate the honest store: {err}");
+    }
+
+    #[test]
+    fn root_integrity_skips_stores_that_cannot_recompute() {
+        // A store whose recompute_root() is None (the trait default, e.g. the
+        // BridgeTree-backed ShieldedStore) is skipped, not falsely flagged.
+        struct NoRecompute;
+        impl Phase2Store for NoRecompute {
+            fn store_label(&self) -> &'static str { "no-recompute" }
+            fn checkpoint_at_height(&self, _h: u64) {}
+            fn checkpoint_count(&self) -> usize { 0 }
+            fn rewind(&self) -> bool { false }
+            fn element_count(&self) -> usize { 0 }
+            fn current_root(&self) -> [u8; 32] { [0x11; 32] }
+            // recompute_root() uses the trait default → None.
+        }
+        let n = NoRecompute;
+        let stores: [&dyn Phase2Store; 1] = [&n];
+        assert!(check_root_integrity(&stores).is_ok(), "None recompute must be skipped");
+    }
+
+    #[test]
+    fn root_integrity_detail_is_operational_never_a_halt() {
+        use crate::security::{Disposition, SecurityDetail};
+        let a = MockStore::new("a");
+        a.add_element();
+        a.corrupt_maintained_root([0xEE; 32]);
+        let stores: [&dyn Phase2Store; 1] = [&a];
+        let detail = Phase2RootIntegrityDetail::new(&stores);
+        let report = detail.sweep();
+        assert!(
+            report.alerts.iter().any(|al| al.code == "root-drift"),
+            "must raise the root-drift alert"
+        );
+        assert!(!report.has_consensus_halt(), "root-integrity is operational, never a halt");
+        assert_ne!(report.disposition(), Disposition::Halt);
+    }
+
+    #[test]
+    fn real_kernel_and_spark_stores_recompute_their_own_root() {
+        // The real KernelStore and SparkStore must expose a working
+        // recompute_root() that agrees with current_root() on an honest store.
+        let kernel = KernelStore::new();
+        let spark = SparkStore::new();
+        let stores: [&dyn Phase2Store; 2] = [&kernel, &spark];
+        // Empty stores: recompute == current.
+        assert!(check_root_integrity(&stores).is_ok(), "empty real stores agree");
+        assert_eq!(kernel.recompute_root(), Some(kernel.current_root()));
+        assert_eq!(spark.recompute_root(), Some(spark.current_root()));
+        // ShieldedStore cannot recompute → None (skipped by the guard).
+        let shielded = ShieldedStore::new();
+        assert_eq!(
+            Phase2Store::recompute_root(&shielded),
+            None,
+            "BridgeTree-backed ShieldedStore has no cheap independent recompute"
+        );
     }
 
     #[test]
