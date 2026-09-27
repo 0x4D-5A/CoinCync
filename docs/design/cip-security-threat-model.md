@@ -111,8 +111,14 @@ re-verify cryptography.
    reach the core `clsag_verify` (both paths call it) or the proof system's
    spec-level soundness; CoinCync has a single implementation of each verifier,
    so a true independent-implementation differential would require a second
-   verifier (itself unaudited) and remains out of scope. The audit is still the
-   ceiling.
+   verifier (itself unaudited) and remains out of scope. A companion
+   **adversarial soundness harness** for the BP+ **range-proof verifier** (the
+   transparent chain's no-negative-value inflation guard) was added the same day
+   — systematic bit-flips, truncation/extension, exact-commitment binding (same
+   value / different blinding must reject), and aggregated commitment
+   swap / reorder / count-mismatch. Both harden verifier *implementation*
+   robustness (reject-the-malformed); neither establishes the proof systems'
+   *spec-level* soundness. The audit is still the ceiling.
 2. **Trusted computing base.** The node code, the libspark FFI, the OS, the
    keys. Guards cannot watch the thing that runs the guards.
 3. **Determinism boundary.** Only consensus-class guards may halt (deterministic,
