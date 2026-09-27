@@ -22,6 +22,8 @@
 use spark_connector::ffi::LibsparkBackend;
 use spark_connector::{CoinBytes, SparkBackend};
 
+use crate::consensus::spark_payload::build::build_spend_payload;
+use crate::consensus::spark_payload::SparkPayload;
 use crate::storage::spark_pool::SparkPoolStore;
 
 /// A shielded coin this wallet owns.
@@ -130,6 +132,41 @@ impl ShieldedNoteStore {
         }
         false
     }
+
+    /// Build a consensus-verifiable shielded spend from one owned note and mark
+    /// that note spent.
+    ///
+    /// Selects the smallest unspent note whose value is STRICTLY GREATER than
+    /// `output_value` (so the fee `note.value − output_value` is positive),
+    /// builds a single-input spend over the pool's cover set anchored at
+    /// `(cover_set_id, anchor_height)`, and — only if the build succeeds — marks
+    /// the note spent. Returns the [`SparkPayload`], or `None` if no single note
+    /// covers `output_value` or the build fails (nothing is marked in that case).
+    ///
+    /// NOTE: the spend pays `output_value` back to THIS wallet's own address (a
+    /// consolidation / change spend). Paying a foreign recipient is a shim
+    /// follow-up — `build_spend_over_set` currently hardcodes the wallet address.
+    pub fn build_self_spend(
+        &mut self,
+        seed: &[u8],
+        pool: &SparkPoolStore,
+        output_value: u64,
+        cover_set_id: u64,
+        anchor_height: u64,
+    ) -> Option<SparkPayload> {
+        // Smallest unspent note strictly greater than the output (positive fee).
+        let chosen = self
+            .unspent()
+            .filter(|n| n.value > output_value)
+            .min_by_key(|n| n.value)?
+            .outpoint
+            .clone();
+        // Build first; only mark spent if the spend actually built.
+        let payload =
+            build_spend_payload(seed, pool, &chosen, output_value, cover_set_id, anchor_height)?;
+        self.mark_spent(&chosen);
+        Some(payload)
+    }
 }
 
 #[cfg(test)]
@@ -182,5 +219,45 @@ mod tests {
         assert!(a.mark_spent(&op0));
         assert!(a.balance() < 6_000);
         assert!(!a.mark_spent(&op0), "already spent");
+    }
+
+    #[test]
+    fn build_self_spend_produces_consensus_verifiable_spend() {
+        use crate::consensus::spark_payload::verify_spark_payload;
+
+        let pool = SparkPoolStore::new();
+        let seed = b"self-spend-seed";
+        // Coins minted at height 1; anchor the spend's cover set there.
+        mint_to_pool(&pool, seed, &[1_000, 2_000, 3_000]);
+
+        let mut store = ShieldedNoteStore::new();
+        assert_eq!(store.scan(seed, &pool), 3);
+        assert_eq!(store.balance(), 6_000);
+
+        // Pay 1_500 back to ourselves → smallest note strictly > 1_500 is 2_000
+        // (fee 500). Build over the height-1 cover set (cover_set_id 0).
+        let payload = store
+            .build_self_spend(seed, &pool, 1_500, 0, 1)
+            .expect("spend builds from the 2_000 note");
+        assert!(payload.spend.is_some(), "produced a spend payload");
+
+        // The wallet produced a consensus-valid spend: the node verifies it and
+        // recovers exactly one linking tag.
+        let backend = LibsparkBackend;
+        let tags = verify_spark_payload(&pool, &backend, &payload, 0).expect("node verifies spend");
+        assert_eq!(tags.len(), 1, "single-input spend → one nullifier tag");
+
+        // The 2_000 note is now spent locally; balance drops to 4_000.
+        assert_eq!(store.balance(), 4_000);
+
+        // A second self-spend of 1_500 now selects the 3_000 note (2_000 gone).
+        let payload2 = store
+            .build_self_spend(seed, &pool, 1_500, 0, 1)
+            .expect("spend builds from the 3_000 note");
+        assert!(payload2.spend.is_some());
+        assert_eq!(store.balance(), 1_000, "only the 1_000 note remains unspent");
+
+        // 1_000 note cannot cover a 1_500 output (needs value strictly greater).
+        assert!(store.build_self_spend(seed, &pool, 1_500, 0, 1).is_none());
     }
 }
