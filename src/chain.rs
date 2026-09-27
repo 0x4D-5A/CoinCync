@@ -428,7 +428,14 @@ pub struct Blockchain {
     // ── Phase 2 privacy stores ──────────────────────────────────────
     // Wrapped in Option — None when Phase 2 is not active.
     // Returns [0u8; 32] roots and no-ops when None.
+    /// LEGACY (one-pool consolidation) — superseded by the `spark_pool_store`
+    /// field (`SparkPoolStore`). Native pre-FFI sketch store; retained gated,
+    /// never instantiated in production. See `storage::spark`.
     pub spark_store: Option<Arc<crate::storage::SparkStore>>,
+    /// LEGACY (one-pool consolidation) — superseded by the `spark_pool_store`
+    /// field. Halo2/native-GK note store (ZK circuit never built); retained
+    /// gated as a differential oracle pending the libspark audit. See
+    /// `storage::shielded`.
     pub shielded_store: Option<Arc<crate::storage::ShieldedStore>>,
     pub kernel_store: Option<Arc<crate::storage::KernelStore>>,
     /// The libspark-FFI-aligned Spark pool store (coins by outpoint + VRF-tag

@@ -1,4 +1,14 @@
-//! # Spark Store
+//! # Spark Store — LEGACY (one-pool consolidation)
+//!
+//! **DEPRECATED / legacy — superseded by `SparkPoolStore` (`storage::spark_pool`).**
+//! This is the native pre-FFI sketch accumulator (32-byte commitments +
+//! 32-byte serials). The shielded design has homogenized on the
+//! libspark-aligned `SparkPoolStore` (variable-length `CoinBytes`, 34-byte VRF
+//! linking tags — the exact shapes the audited libspark spend path needs); this
+//! store's fixed-shape model does not match it. Retained (gated off), not
+//! deleted, pending the libspark external audit — see
+//! `docs/design/cip-shielded-one-pool-consolidation.md`. New shielded work
+//! targets `SparkPoolStore`.
 //!
 //! Persistent storage for the Lelantus Spark accumulator and the set of
 //! spent serial tags. When constructed via [`SparkStore::open_with_db`]
