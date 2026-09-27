@@ -189,6 +189,12 @@ enum Command {
         /// Amount to send, in atomic units.
         #[arg(long)]
         amount: u64,
+        /// Self-contained REGTEST run: bootstrap a local pool, fund this
+        /// wallet, then build + verify — no node needed. Without this the
+        /// command fetches the live node's cover set via `get_shielded_cover_set`
+        /// (`--node`) and builds against it.
+        #[arg(long)]
+        demo: bool,
         /// Wallet password. Use `-` to read from stdin. Reads
         /// `COINCYNC_WALLET_PASSWORD` env if neither flag nor stdin is provided.
         #[arg(short, long, env = "COINCYNC_WALLET_PASSWORD", hide_env_values = true)]
@@ -799,9 +805,12 @@ async fn main() {
             cmd_shielded_address(&wallet_path, password).await
         }
         #[cfg(all(feature = "sketch-gk-proof", feature = "libspark-ffi"))]
-        Command::ShieldedSend { to, amount, password } => {
-            cmd_shielded_send(&wallet_path, password, to, amount).await
-        }
+        Command::ShieldedSend {
+            to,
+            amount,
+            demo,
+            password,
+        } => cmd_shielded_send(&wallet_path, password, &cli.node, to, amount, demo).await,
         Command::Send {
             password,
             to_spend,
@@ -1900,16 +1909,11 @@ async fn cmd_shielded_address(path: &PathBuf, password: Option<String>) -> Resul
 async fn cmd_shielded_send(
     path: &PathBuf,
     password: Option<String>,
+    node: &str,
     to: String,
     amount: u64,
+    demo: bool,
 ) -> Result<(), String> {
-    use coincync::consensus::spark_payload::{derive_outpoint, verify_spark_payload};
-    use coincync::storage::spark_pool::SparkPoolStore;
-    use coincync::wallet::shielded_notes::ShieldedNoteStore;
-    use spark_connector::ffi::{
-        build_mint_bundle, serial_context, spend_outputs, verify_mint_bundle, LibsparkBackend,
-    };
-
     if to.is_empty() {
         return Err("--to must be a bech32m Spark address (see `shielded-address`)".into());
     }
@@ -1920,21 +1924,34 @@ async fn cmd_shielded_send(
     let password = resolve_password(password, false)?;
     let data =
         load_wallet(path, Some(password.as_str())).map_err(|e| format!("unlock failed: {e}"))?;
-    let seed = &data.seed;
+    let seed = data.seed;
+
+    if demo {
+        shielded_send_demo(&seed, &to, amount)
+    } else {
+        shielded_send_live(&seed, node, &to, amount).await
+    }
+}
+
+/// Self-contained REGTEST run: bootstrap a local pool, fund this wallet, build +
+/// NODE-verify a transfer — no node required. Proves the whole path offline.
+#[cfg(all(feature = "sketch-gk-proof", feature = "libspark-ffi"))]
+fn shielded_send_demo(seed: &[u8], to: &str, amount: u64) -> Result<(), String> {
+    use coincync::consensus::spark_payload::{derive_outpoint, verify_spark_payload};
+    use coincync::storage::spark_pool::SparkPoolStore;
+    use coincync::wallet::shielded_notes::ShieldedNoteStore;
+    use spark_connector::ffi::{
+        build_mint_bundle, serial_context, spend_outputs, verify_mint_bundle, LibsparkBackend,
+    };
 
     eprintln!(
-        "shielded-send: REGTEST demonstration. Shielded txs are activation-gated OFF on \
-         testnet/mainnet and there is no shielded node RPC yet, so this bootstraps a local \
-         pool, funds this wallet, then builds + NODE-verifies a real shielded transfer. It \
-         is NOT submitted to any network."
+        "shielded-send --demo: REGTEST run. Bootstraps a local pool, funds this wallet, then \
+         builds + NODE-verifies a real shielded transfer entirely in-process. NOT submitted."
     );
 
-    // Bootstrap a local regtest pool funded to this wallet (no live shielded
-    // pool exists to draw from). Two coins so one strictly covers `amount`.
     let pool = SparkPoolStore::new();
     let fund = [amount + 1_000, amount + 5_000];
-    let ctx =
-        serial_context(&derive_outpoint(&[], 0)).ok_or("serial_context derivation failed")?;
+    let ctx = serial_context(&derive_outpoint(&[], 0)).ok_or("serial_context derivation failed")?;
     let bundle = build_mint_bundle(seed, &fund, &ctx).ok_or("mint bundle build failed")?;
     let (_total, coins) = verify_mint_bundle(&bundle).ok_or("mint bundle verify failed")?;
     for (i, coin) in coins.iter().enumerate() {
@@ -1943,7 +1960,6 @@ async fn cmd_shielded_send(
             .ok_or("pool add_coin failed (duplicate outpoint)")?;
     }
 
-    // Scan the pool for this wallet's notes.
     let mut notes = ShieldedNoteStore::new();
     let found = notes.scan(seed, &pool);
     println!(
@@ -1951,7 +1967,6 @@ async fn cmd_shielded_send(
         notes.balance()
     );
 
-    // Build the transfer to `to`, then verify it exactly as the node would.
     let payload = notes
         .build_transfer(seed, &pool, to.as_bytes(), amount, 0, 1)
         .ok_or("failed to build shielded transfer (insufficient notes or bad address)")?;
@@ -1964,20 +1979,130 @@ async fn cmd_shielded_send(
         .map_err(|e| format!("node verification failed: {e}"))?;
     let (out_coins, _) = spend_outputs(&sb.bundle).ok_or("extract spend outputs failed")?;
 
+    report_built_transfer(to, amount, pool.coin_count(), out_coins.len(), tags.len(), sb.bundle.len());
+    Ok(())
+}
+
+/// LIVE run: fetch the node's anchored cover set via `get_shielded_cover_set`,
+/// scan it for this wallet's notes, and build + self-verify a shielded spend to
+/// `to` against that set — the real client→node path. NOT submitted (there is no
+/// shielded submission RPC yet; see the endpoint's docs).
+#[cfg(all(feature = "sketch-gk-proof", feature = "libspark-ffi"))]
+async fn shielded_send_live(seed: &[u8], node: &str, to: &str, amount: u64) -> Result<(), String> {
+    use spark_connector::ffi::{build_spend_to_address, LibsparkBackend};
+    use spark_connector::{CoinBytes, SparkBackend};
+
+    // Anchor at the node's current tip.
+    let info = rpc_call(node, "get_info", serde_json::json!([]))
+        .await
+        .map_err(|e| format!("get_info: {e}"))?;
+    let anchor_height = info
+        .get("height")
+        .and_then(|v| v.as_u64())
+        .ok_or("node get_info missing height")?;
+
+    // Fetch the anchored cover set (the shielded counterpart to a decoy set).
+    let cs = rpc_call(node, "get_shielded_cover_set", serde_json::json!([0, anchor_height]))
+        .await
+        .map_err(|e| {
+            format!(
+                "get_shielded_cover_set: {e} (the node must be a sketch-gk-proof build exposing \
+                 this RPC)"
+            )
+        })?;
+    let arr = cs
+        .get("coins")
+        .and_then(|c| c.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    // Rebuild the ordered cover set + per-coin serial contexts from the response.
+    let mut entries: Vec<(usize, Vec<u8>, Vec<u8>)> = Vec::with_capacity(arr.len());
+    for e in &arr {
+        let index = e
+            .get("index")
+            .and_then(|v| v.as_u64())
+            .ok_or("cover entry missing index")? as usize;
+        let coin = hex::decode(e.get("coin").and_then(|v| v.as_str()).ok_or("cover entry missing coin")?)
+            .map_err(|err| format!("bad coin hex: {err}"))?;
+        let ctx = hex::decode(
+            e.get("serial_context")
+                .and_then(|v| v.as_str())
+                .ok_or("cover entry missing serial_context")?,
+        )
+        .map_err(|err| format!("bad serial_context hex: {err}"))?;
+        entries.push((index, coin, ctx));
+    }
+    entries.sort_by_key(|(i, _, _)| *i);
+    let cover_coins: Vec<CoinBytes> = entries.iter().map(|(_, c, _)| CoinBytes(c.clone())).collect();
+
+    // Scan the fetched set for coins this wallet owns.
+    let backend = LibsparkBackend;
+    let mut owned: Vec<(usize, u64, Vec<u8>)> = Vec::new(); // (spend_index, value, ctx)
+    for (pos, (_, coin, ctx)) in entries.iter().enumerate() {
+        if let Ok(Some(id)) = backend.identify(seed, &CoinBytes(coin.clone()), ctx) {
+            owned.push((pos, id.value, ctx.clone()));
+        }
+    }
+    println!(
+        "Cover set: {} coin(s) at anchor height {anchor_height}; {} owned by this wallet",
+        cover_coins.len(),
+        owned.len()
+    );
+    if owned.is_empty() {
+        return Err(format!(
+            "no owned shielded notes in the pool at anchor height {anchor_height} — nothing to \
+             spend. The shielded pool is empty until activation; use --demo for a self-contained \
+             run."
+        ));
+    }
+
+    // Pick the smallest owned note strictly greater than `amount` (positive fee).
+    let (spend_index, chosen_value, chosen_ctx) = owned
+        .iter()
+        .filter(|(_, v, _)| *v > amount)
+        .min_by_key(|(_, v, _)| *v)
+        .cloned()
+        .ok_or_else(|| {
+            let largest = owned.iter().map(|(_, v, _)| *v).max().unwrap_or(0);
+            format!("no single owned note covers {amount} atomic (largest owned note is {largest})")
+        })?;
+
+    // Build the spend to the recipient over the fetched cover set, then
+    // self-verify the bundle (standalone — the node re-verifies on submit).
+    let spend = build_spend_to_address(seed, &cover_coins, spend_index, &chosen_ctx, amount, to.as_bytes())
+        .ok_or("failed to build shielded spend (bad recipient address or output value)")?;
+    let tags = backend
+        .verify_spend(&[], &spend, 0, 0)
+        .map_err(|e| format!("built spend failed self-verification: {e}"))?;
+
+    println!("  Funding note:    value {chosen_value} atomic at cover index {spend_index}");
+    report_built_transfer(to, amount, cover_coins.len(), 1, tags.len(), spend.0.len());
+    Ok(())
+}
+
+#[cfg(all(feature = "sketch-gk-proof", feature = "libspark-ffi"))]
+fn report_built_transfer(
+    to: &str,
+    amount: u64,
+    cover_len: usize,
+    output_coins: usize,
+    tags: usize,
+    bundle_len: usize,
+) {
     println!();
     println!("Built + verified shielded transfer:");
     println!("  To:              {to}");
     println!("  Amount:          {amount} atomic");
-    println!("  Cover set:       {} coin(s)", pool.coin_count());
-    println!("  Output coins:    {}", out_coins.len());
-    println!("  Nullifier tags:  {} (funding note spent)", tags.len());
-    println!("  Bundle size:     {} bytes", sb.bundle.len());
-    println!("  Remaining bal:   {} atomic", notes.balance());
+    println!("  Cover set:       {cover_len} coin(s)");
+    println!("  Output coins:    {output_coins}");
+    println!("  Nullifier tags:  {tags} (funding note spent)");
+    println!("  Bundle size:     {bundle_len} bytes");
     println!();
     println!(
-        "NOTE: not submitted — live shielded submission awaits activation and a shielded node RPC."
+        "NOTE: not submitted — live shielded submission awaits activation and a shielded \
+         submission RPC. The cover set was fetched from the node; the spend is ready to submit."
     );
-    Ok(())
 }
 
 // ═══════════════════════════════════════════════════════════════════════
