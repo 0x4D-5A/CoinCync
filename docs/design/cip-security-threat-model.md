@@ -102,7 +102,17 @@ re-verify cryptography.
 ## Systemic limits — the honest ~1%
 1. **Unsound crypto that verifies.** No monitor catches a broken proof accepted
    as valid. The unaudited Spark/GK crypto is the real risk. **Only an external
-   audit closes this** — it is not a guard we can add.
+   audit closes this** — it is not a guard we can add. *Partial coverage added
+   2026-09-26:* `crypto::differential_ring_sig_check` differentials the
+   optimized ring-signature path (verification cache + rayon parallel) against a
+   fresh, uncached, serial reference, catching the **optimization/caching-layer**
+   bug class (cache poisoning, a mis-keyed cache, parallel/index errors) — a
+   cached "valid" for an invalid signature is an inflation vector. It does NOT
+   reach the core `clsag_verify` (both paths call it) or the proof system's
+   spec-level soundness; CoinCync has a single implementation of each verifier,
+   so a true independent-implementation differential would require a second
+   verifier (itself unaudited) and remains out of scope. The audit is still the
+   ceiling.
 2. **Trusted computing base.** The node code, the libspark FFI, the OS, the
    keys. Guards cannot watch the thing that runs the guards.
 3. **Determinism boundary.** Only consensus-class guards may halt (deterministic,

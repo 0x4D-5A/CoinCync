@@ -146,7 +146,8 @@ pub use audit::{BlockSupplyDelta, SupplyAuditResult, SupplyCommitment, SupplySna
 pub use cache::{global_cache, proof_cache_key, ring_sig_cache_key, CacheStats, VerificationCache};
 
 pub use batch_verify::{
-    BatchVerifier, BatchVerifyResult, ParallelTxValidator, SignatureData, VerificationStats,
+    differential_ring_sig_check, BatchVerifier, BatchVerifyResult, ParallelTxValidator,
+    SignatureData, VerificationStats,
 };
 
 pub use parallel_proofs::{
