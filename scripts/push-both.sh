@@ -2,7 +2,14 @@
 #
 # push-both.sh — push ONE branch to the project's public home(s).
 #
-#   • GitHub    (ghostrider1092/CoinCync)  remote: mirror  (HTTPS/gh)
+#   • PRIMARY  GitHub org   (Coincync/Coincync-Testnet-)   remote: origin
+#   • MIRROR   GitHub user  (ghostrider1092/CoinCync)       remote: mirror
+#
+# The primary home moved to the Coincync GitHub org on 2026-09-26 after the
+# org's GitHub block was lifted; the ghostrider1092/CoinCync user repo is kept
+# as a backup mirror. Note org `main` is ruleset-protected (PR review +
+# signed commits + required CI) — this script pushes feature branches; `main`
+# advances only through a reviewed PR.
 #
 # Codeberg was REMOVED 2026-08-20: Codeberg's usage policy prohibits
 # cryptocurrency/blockchain projects, so it was never a valid home (the old
@@ -21,10 +28,13 @@ set -euo pipefail
 
 branch="${1:?usage: scripts/push-both.sh <branch>}"
 
-echo "→ GitHub mirror (ghostrider1092/CoinCync) …"
+echo "→ GitHub org — PRIMARY (Coincync/Coincync-Testnet-) …"
+git push origin "$branch:refs/heads/$branch"
+
+echo "→ GitHub user — mirror (ghostrider1092/CoinCync) …"
 git push mirror "$branch:refs/heads/$branch"
 
-# ── Optional second home (a REAL crypto-tolerant forge — NOT Codeberg) ────────
+# ── Optional third home (a REAL crypto-tolerant forge — NOT Codeberg) ─────────
 # Add the remote once, e.g.:
 #   git remote add fallback git@gitlab.com:<you>/coincync.git
 # then uncomment (keep the explicit single-branch refspec — never --all):
@@ -33,4 +43,4 @@ git push mirror "$branch:refs/heads/$branch"
 # git push fallback "$branch:refs/heads/$branch"
 # ─────────────────────────────────────────────────────────────────────────────
 
-echo "✓ '$branch' pushed to the GitHub mirror."
+echo "✓ '$branch' pushed to the GitHub org (primary) + user mirror."
