@@ -112,8 +112,10 @@ pub fn verify_spark_payload<B: SparkBackend>(
         return Err(Error::SparkVerifyFailed);
     }
     let Some(sb) = &payload.spend else {
-        // Mint-only tx: no spend to verify here. (Each mint coin's own
-        // value/range binding is checked separately — TODO in the mint path.)
+        // Mint-only tx: no spend bundle to verify here. Each mint coin's own
+        // value/range binding is authenticated by `verify_mint_shield_in`
+        // (libspark `verify_mint_bundle`) at the block-verify caller, which also
+        // requires a shield-in to carry that bundle and rejects bare outputs.
         return Ok(Vec::new());
     };
     let cover = store.cover_set_at(sb.cover_set_id, sb.anchor_height);
@@ -297,40 +299,40 @@ pub fn verify_mint_shield_in(mint_bundle: &[u8], value_balance: i64) -> Result<(
 #[cfg(feature = "libspark-ffi")]
 pub mod build {
     use super::*;
-    use spark_connector::ffi::{build_spend_over_set, mint_to_seed, serial_context};
+    use spark_connector::ffi::{build_mint_bundle, build_spend_over_set, serial_context};
 
-    /// Build a mint-side (shield-in) payload: one coin per value, minted to the
-    /// `seed` wallet and bound to the deterministic context
-    /// `serial_context(derive_outpoint(tx_input_outpoints, vout))`. The payload's
-    /// `value_balance` is set to `-(Σ values)` — a shield-IN is NEGATIVE (value
-    /// entering the pool), the sign the pool-value accounting and
-    /// `verify_mint_shield_in` require. Returns the payload plus the per-output
-    /// contexts the apply feed stores. `None` on any FFI failure.
+    /// Build an AUTHENTICATED mint-side (shield-in) payload: one libspark
+    /// `MintTransaction` over `values`, carrying a per-coin Schnorr value proof
+    /// so a verifier trusts each coin's public value (the per-mint value/range
+    /// binding). All coins share ONE tx-level serial context
+    /// `serial_context(derive_outpoint(tx_input_outpoints, 0))` — safe because
+    /// each coin's serial (hence linking tag) is made distinct by libspark's
+    /// per-coin random nonce, not the context (verified against the vendored
+    /// serial derivation, `coin.cpp` s = hash_ser(k, ctx) + …). The coins are
+    /// extracted from the verified bundle at apply, so `outputs` stays EMPTY;
+    /// `value_balance = -(Σ values)` (shield-IN is negative). Returns the payload
+    /// plus the shared context (apply re-derives the identical one). `None` on
+    /// any FFI failure.
     pub fn build_mint_payload(
         seed: &[u8],
         values: &[u64],
         tx_input_outpoints: &[Vec<u8>],
     ) -> Option<(SparkPayload, Vec<Vec<u8>>)> {
-        let mut outputs = Vec::with_capacity(values.len());
-        let mut contexts = Vec::with_capacity(values.len());
-        for (vout, &v) in values.iter().enumerate() {
-            let op = derive_outpoint(tx_input_outpoints, vout as u32);
-            let ctx = serial_context(&op)?;
-            let coin = mint_to_seed(seed, v, &ctx)?;
-            outputs.push(coin.0);
-            contexts.push(ctx);
-        }
-        // Shield-in: value entering the pool is NEGATIVE value_balance.
+        let shared_ctx = serial_context(&derive_outpoint(tx_input_outpoints, 0))?;
+        let bundle = build_mint_bundle(seed, values, &shared_ctx)?;
         let value_balance = -(values.iter().sum::<u64>() as i64);
         Some((
             SparkPayload {
                 version: SPARK_PAYLOAD_VERSION,
-                mint: None,
-                outputs,
+                mint: Some(bundle),
+                // Coins enter via the verified mint bundle at apply, not bare
+                // outputs — an unauthenticated `outputs` entry is rejected at
+                // verify (no value proof).
+                outputs: Vec::new(),
                 spend: None,
                 value_balance,
             },
-            contexts,
+            vec![shared_ctx; values.len()],
         ))
     }
 
@@ -635,9 +637,18 @@ mod tests {
         let (mint_payload, contexts) =
             build_mint_payload(seed, &values, &mint_inputs).expect("build mint payload");
 
-        // Apply the mint payload → feeds the pool at height 1.
-        apply_spark_payload(&store, &mint_payload, &mint_inputs, &contexts, &[], 1)
-            .expect("apply mint payload");
+        // Authenticated mint: coins come from the verified mint bundle (not bare
+        // `outputs`), fed with the shared tx-level serial context — exactly as
+        // the chain's apply hook does (the FFI extraction lives at the edge;
+        // `apply_spark_payload` stays pure). `contexts` holds that shared ctx.
+        let mint = mint_payload.mint.as_ref().expect("authenticated mint bundle");
+        let (_total, coins) =
+            spark_connector::ffi::verify_mint_bundle(mint).expect("verify mint bundle");
+        let shared_ctx = contexts[0].clone();
+        for (i, coin) in coins.iter().enumerate() {
+            let op = derive_outpoint(&mint_inputs, i as u32);
+            assert!(store.add_coin(op, coin.clone(), shared_ctx.clone(), 1).is_some());
+        }
         assert_eq!(store.coin_count(), n);
 
         // Spend the coin at vout 2 (its outpoint is deterministic from the mint).

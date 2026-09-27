@@ -906,6 +906,23 @@ impl Blockchain {
                     "spark v2 tx {idx}: pool underflow — unshields more than the shielded pool holds"
                 ));
             }
+            // No UNAUTHENTICATED coin entry: coins enter the pool ONLY via an
+            // authenticated mint bundle (per-coin value proof) or a spend's own
+            // outputs — never via bare `payload.outputs`, which would inject
+            // coins with no value proof. Reject any bare-output payload.
+            if !payload.outputs.is_empty() {
+                return Err(format!(
+                    "spark v2 tx {idx}: unauthenticated coin entry — bare outputs without a mint bundle"
+                ));
+            }
+            // A shield-in (value ENTERING the pool, value_balance < 0) MUST carry
+            // an authenticated mint bundle proving each minted coin's value;
+            // otherwise value could be shielded in with no coin-level proof.
+            if payload.value_balance < 0 && payload.mint.is_none() {
+                return Err(format!(
+                    "spark v2 tx {idx}: shield-in requires an authenticated mint bundle"
+                ));
+            }
             // Authenticated shield-in: the minted coins' total value proof must
             // equal the value entering the pool (−value_balance). Together with
             // the bridge above this fully conserves value across the veil.
@@ -4578,6 +4595,45 @@ mod tests {
             chain.verify_block_spark_v2(std::slice::from_ref(&spend_tx)).is_err(),
             "chain verify hook rejects the now-spent spend (double-spend guard)"
         );
+    }
+
+    /// The verify hook rejects UNAUTHENTICATED coin entry: a shielded payload
+    /// carrying bare `outputs` coins with no mint bundle (no per-coin value
+    /// proof) must be rejected before any state changes.
+    #[cfg(all(feature = "sketch-gk-proof", feature = "libspark-ffi"))]
+    #[test]
+    fn spark_v2_rejects_unauthenticated_coin_entry() {
+        use crate::consensus::spark_payload::{SparkPayload, SPARK_PAYLOAD_VERSION};
+        use crate::storage::spark_pool::SparkPoolStore;
+        use crate::transaction::{Transaction, TxType};
+        use std::sync::Arc;
+
+        let mut chain = Blockchain::new();
+        chain.spark_pool_store = Some(Arc::new(SparkPoolStore::new()));
+        let mk = |extra: Vec<u8>| Transaction {
+            version: 1,
+            tx_type: TxType::Shielded,
+            inputs: vec![],
+            outputs: vec![],
+            fee: crate::primitives::Amount::from_atomic(0),
+            range_proof: vec![],
+            extra,
+        };
+
+        // Bare output coin with no mint bundle = unauthenticated coin entry.
+        // value_balance = 0 so the transparent value bridge (empty commitments)
+        // passes and execution reaches the coin-entry guard.
+        let bare = SparkPayload {
+            version: SPARK_PAYLOAD_VERSION,
+            mint: None,
+            outputs: vec![vec![7u8; 40]],
+            spend: None,
+            value_balance: 0,
+        };
+        let err = chain
+            .verify_block_spark_v2(std::slice::from_ref(&mk(bare.encode())))
+            .unwrap_err();
+        assert!(err.contains("unauthenticated coin entry"), "got: {err}");
     }
 
     /// An AUTHENTICATED shield-in: a `TxType::Shielded` tx whose payload carries
