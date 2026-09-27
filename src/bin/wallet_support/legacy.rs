@@ -161,6 +161,40 @@ enum Command {
     /// Show the current shielded-pool / Spark / MW stats from the node.
     PrivacyStats,
 
+    /// Print this wallet's shielded (Spark) receive address.
+    ///
+    /// EXPERIMENTAL / regtest-gated: shielded txs are activation-gated OFF on
+    /// testnet/mainnet. Present only in a `sketch-gk-proof + libspark-ffi` build.
+    #[cfg(all(feature = "sketch-gk-proof", feature = "libspark-ffi"))]
+    ShieldedAddress {
+        /// Wallet password. Use `-` to read from stdin. Reads
+        /// `COINCYNC_WALLET_PASSWORD` env if neither flag nor stdin is provided.
+        #[arg(short, long, env = "COINCYNC_WALLET_PASSWORD", hide_env_values = true)]
+        password: Option<String>,
+    },
+
+    /// Build + verify a shielded (Spark) transfer to another wallet.
+    ///
+    /// EXPERIMENTAL / regtest-only: shielded txs are activation-gated OFF on
+    /// testnet/mainnet and there is no shielded node RPC yet, so this runs the
+    /// full transfer path end to end against a local regtest pool (funds this
+    /// wallet, scans, builds, and NODE-verifies a real shielded transfer) and
+    /// reports it. Live submission awaits activation + a shielded RPC. Present
+    /// only in a `sketch-gk-proof + libspark-ffi` build.
+    #[cfg(all(feature = "sketch-gk-proof", feature = "libspark-ffi"))]
+    ShieldedSend {
+        /// Recipient's bech32m Spark address (see `shielded-address`).
+        #[arg(long)]
+        to: String,
+        /// Amount to send, in atomic units.
+        #[arg(long)]
+        amount: u64,
+        /// Wallet password. Use `-` to read from stdin. Reads
+        /// `COINCYNC_WALLET_PASSWORD` env if neither flag nor stdin is provided.
+        #[arg(short, long, env = "COINCYNC_WALLET_PASSWORD", hide_env_values = true)]
+        password: Option<String>,
+    },
+
     /// Build and submit a privacy transaction to the node.
     Send {
         /// Wallet password. Use `-` to read from stdin (recommended for
@@ -760,6 +794,14 @@ async fn main() {
             max_blocks,
         } => cmd_scan(&wallet_path, password, from, max_blocks, &cli.node).await,
         Command::PrivacyStats => cmd_privacy_stats(&cli.node).await,
+        #[cfg(all(feature = "sketch-gk-proof", feature = "libspark-ffi"))]
+        Command::ShieldedAddress { password } => {
+            cmd_shielded_address(&wallet_path, password).await
+        }
+        #[cfg(all(feature = "sketch-gk-proof", feature = "libspark-ffi"))]
+        Command::ShieldedSend { to, amount, password } => {
+            cmd_shielded_send(&wallet_path, password, to, amount).await
+        }
         Command::Send {
             password,
             to_spend,
@@ -1828,6 +1870,113 @@ async fn cmd_show_seed(path: &PathBuf, password: Option<String>) -> Result<(), S
         println!(" was persisted — only the raw 32-byte seed is available.");
         println!(" Restore the wallet from the seed to rebuild the phrase.)");
     }
+    Ok(())
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Shielded (Spark) CLI — EXPERIMENTAL, regtest-gated
+//
+// Present only in a `sketch-gk-proof + libspark-ffi` build. Shielded txs are
+// activation-gated OFF on testnet/mainnet and there is no shielded node RPC
+// yet, so `shielded-send` runs the full transfer path end to end against a
+// LOCAL regtest pool. When shielded activates and a cover-set / submission RPC
+// lands, the in-process pool is swapped for the live one.
+// ═══════════════════════════════════════════════════════════════════════
+
+#[cfg(all(feature = "sketch-gk-proof", feature = "libspark-ffi"))]
+async fn cmd_shielded_address(path: &PathBuf, password: Option<String>) -> Result<(), String> {
+    use spark_connector::ffi::address_from_seed;
+
+    let password = resolve_password(password, false)?;
+    let data =
+        load_wallet(path, Some(password.as_str())).map_err(|e| format!("unlock failed: {e}"))?;
+    let addr = address_from_seed(&data.seed).ok_or("shielded address derivation failed")?;
+    let s = String::from_utf8(addr).map_err(|_| "shielded address is not valid UTF-8")?;
+    println!("{s}");
+    Ok(())
+}
+
+#[cfg(all(feature = "sketch-gk-proof", feature = "libspark-ffi"))]
+async fn cmd_shielded_send(
+    path: &PathBuf,
+    password: Option<String>,
+    to: String,
+    amount: u64,
+) -> Result<(), String> {
+    use coincync::consensus::spark_payload::{derive_outpoint, verify_spark_payload};
+    use coincync::storage::spark_pool::SparkPoolStore;
+    use coincync::wallet::shielded_notes::ShieldedNoteStore;
+    use spark_connector::ffi::{
+        build_mint_bundle, serial_context, spend_outputs, verify_mint_bundle, LibsparkBackend,
+    };
+
+    if to.is_empty() {
+        return Err("--to must be a bech32m Spark address (see `shielded-address`)".into());
+    }
+    if amount == 0 {
+        return Err("--amount must be greater than zero".into());
+    }
+
+    let password = resolve_password(password, false)?;
+    let data =
+        load_wallet(path, Some(password.as_str())).map_err(|e| format!("unlock failed: {e}"))?;
+    let seed = &data.seed;
+
+    eprintln!(
+        "shielded-send: REGTEST demonstration. Shielded txs are activation-gated OFF on \
+         testnet/mainnet and there is no shielded node RPC yet, so this bootstraps a local \
+         pool, funds this wallet, then builds + NODE-verifies a real shielded transfer. It \
+         is NOT submitted to any network."
+    );
+
+    // Bootstrap a local regtest pool funded to this wallet (no live shielded
+    // pool exists to draw from). Two coins so one strictly covers `amount`.
+    let pool = SparkPoolStore::new();
+    let fund = [amount + 1_000, amount + 5_000];
+    let ctx =
+        serial_context(&derive_outpoint(&[], 0)).ok_or("serial_context derivation failed")?;
+    let bundle = build_mint_bundle(seed, &fund, &ctx).ok_or("mint bundle build failed")?;
+    let (_total, coins) = verify_mint_bundle(&bundle).ok_or("mint bundle verify failed")?;
+    for (i, coin) in coins.iter().enumerate() {
+        let op = derive_outpoint(&[], i as u32);
+        pool.add_coin(op, coin.clone(), ctx.clone(), 1)
+            .ok_or("pool add_coin failed (duplicate outpoint)")?;
+    }
+
+    // Scan the pool for this wallet's notes.
+    let mut notes = ShieldedNoteStore::new();
+    let found = notes.scan(seed, &pool);
+    println!(
+        "Scanned pool: {found} owned note(s), shielded balance {} atomic",
+        notes.balance()
+    );
+
+    // Build the transfer to `to`, then verify it exactly as the node would.
+    let payload = notes
+        .build_transfer(seed, &pool, to.as_bytes(), amount, 0, 1)
+        .ok_or("failed to build shielded transfer (insufficient notes or bad address)")?;
+    let sb = payload
+        .spend
+        .as_ref()
+        .ok_or("built payload unexpectedly carries no spend")?;
+    let backend = LibsparkBackend;
+    let tags = verify_spark_payload(&pool, &backend, &payload, 0)
+        .map_err(|e| format!("node verification failed: {e}"))?;
+    let (out_coins, _) = spend_outputs(&sb.bundle).ok_or("extract spend outputs failed")?;
+
+    println!();
+    println!("Built + verified shielded transfer:");
+    println!("  To:              {to}");
+    println!("  Amount:          {amount} atomic");
+    println!("  Cover set:       {} coin(s)", pool.coin_count());
+    println!("  Output coins:    {}", out_coins.len());
+    println!("  Nullifier tags:  {} (funding note spent)", tags.len());
+    println!("  Bundle size:     {} bytes", sb.bundle.len());
+    println!("  Remaining bal:   {} atomic", notes.balance());
+    println!();
+    println!(
+        "NOTE: not submitted — live shielded submission awaits activation and a shielded node RPC."
+    );
     Ok(())
 }
 
