@@ -4604,6 +4604,147 @@ mod tests {
         );
     }
 
+    /// IN-BLOCK shielded-consensus SOAK. Drives mint → spend → double-spend →
+    /// reorg cycles through the real chain block hooks (verify_block_spark_v2 →
+    /// apply_spark_v2_txs, with checkpoint/rewind) using real libspark proofs,
+    /// continuously for `SHIELDED_SOAK_SECS` (default 20s burst). After every op
+    /// it asserts the pool invariants (pool_value >= 0, no consensus halt) and
+    /// that adversarial txs (double-spend) are rejected; a reorg must roll the
+    /// pool back to empty. Panics with the reproducing seed on any anomaly. This
+    /// is the in-block counterpart to the crypto-stack soak — run it before any
+    /// activation (see docs/design/cip-shielded-txtype.md).
+    ///
+    /// Run the full soak: `SHIELDED_SOAK_SECS=86400 cargo test --release
+    /// --features "testnet sketch-gk-proof libspark-ffi" soak_shielded_in_block
+    /// -- --ignored --nocapture` (needs SPARK_OPENSSL_DIR).
+    #[cfg(all(feature = "sketch-gk-proof", feature = "libspark-ffi"))]
+    #[test]
+    #[ignore = "soak: drive with SHIELDED_SOAK_SECS"]
+    fn soak_shielded_in_block_consensus() {
+        use crate::consensus::spark_payload::build::{build_mint_payload, build_spend_payload};
+        use crate::consensus::spark_payload::derive_outpoint;
+        use crate::storage::spark_pool::SparkPoolStore;
+        use crate::transaction::{Transaction, TxType};
+        use spark_connector::ffi::cover_set_size;
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        let secs: u64 = std::env::var("SHIELDED_SOAK_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(20);
+        let seed0: u64 = std::env::var("SHIELDED_SOAK_SEED")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0xC0FFEE_1234);
+        let deadline = Instant::now() + Duration::from_secs(secs);
+
+        let mut chain = Blockchain::new();
+        chain.spark_pool_store = Some(Arc::new(SparkPoolStore::new()));
+        let store = Arc::clone(chain.spark_pool_store.as_ref().unwrap());
+        let n = cover_set_size().expect("cover set size");
+
+        let mk = |extra: Vec<u8>| Transaction {
+            version: 1,
+            tx_type: TxType::Shielded,
+            inputs: vec![],
+            outputs: vec![],
+            fee: crate::primitives::Amount::from_atomic(0),
+            range_proof: vec![],
+            extra,
+        };
+
+        let mut s = seed0;
+        let mut rand = || {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            s >> 33
+        };
+        let mut cycles: u64 = 0;
+
+        macro_rules! anomaly {
+            ($ctx:expr) => {
+                panic!(
+                    "SHIELDED SOAK ANOMALY [{}] seed={} cycle={} pool_value={}",
+                    $ctx,
+                    seed0,
+                    cycles,
+                    store.pool_value()
+                )
+            };
+        }
+        // Sweep at the cycle's tip height (2: mint at h1, spend outputs at h2),
+        // so the pool guard's coin/tag-height checks see a consistent tip.
+        macro_rules! invariants {
+            () => {{
+                if store.pool_value() < 0 {
+                    anomaly!("pool_value_negative");
+                }
+                if chain.security_sweep(2).has_consensus_halt() {
+                    anomaly!("security_consensus_halt");
+                }
+            }};
+        }
+
+        while Instant::now() < deadline {
+            cycles += 1;
+            let wseed = format!("soak-{seed0}-{cycles}");
+
+            // ── MINT a fresh cover set (shield-in) at height 1 ───────────────
+            let values: Vec<u64> = (0..n as u64).map(|i| 1_000 + (rand() % 9_000) + i).collect();
+            let (mint_payload, _) = build_mint_payload(wseed.as_bytes(), &values, &[])
+                .unwrap_or_else(|| anomaly!("build_mint"));
+            let mint_tx = mk(mint_payload.encode());
+            // The mint feed is APPLIED directly: a shield-in's value bridge needs
+            // transparent backing inputs (Σ pseudo == V·H), which a pure-shielded
+            // soak tx has none of — the mint bundle's own per-coin value proof is
+            // covered by the unit tests + the FFI mint-bundle soak. This soak
+            // stresses the mint→spend→reorg STATE machine + the spend verify.
+            chain.checkpoint_phase2_stores(1);
+            chain.apply_spark_v2_txs(std::slice::from_ref(&mint_tx), 1);
+            if store.coin_count() != n {
+                anomaly!("mint_coin_count");
+            }
+            invariants!();
+
+            // ── SPEND a random owned coin (unshield to a transparent output) ──
+            let vout = (rand() as u32) % (n as u32);
+            let owned_op = derive_outpoint(&[], vout);
+            let spend_payload = build_spend_payload(wseed.as_bytes(), store.as_ref(), &owned_op, 100, 0, 1)
+                .unwrap_or_else(|| anomaly!("build_spend"));
+            let spend_tx = mk(spend_payload.encode());
+            chain.checkpoint_phase2_stores(2);
+            if chain.verify_block_spark_v2(std::slice::from_ref(&spend_tx)).is_err() {
+                anomaly!("valid_spend_rejected");
+            }
+            let before = store.coin_count();
+            chain.apply_spark_v2_txs(std::slice::from_ref(&spend_tx), 2);
+            if store.coin_count() <= before {
+                anomaly!("spend_output_not_fed");
+            }
+            invariants!();
+
+            // ── ADVERSARIAL: the same spend is now a double-spend → REJECT ────
+            if chain.verify_block_spark_v2(std::slice::from_ref(&spend_tx)).is_ok() {
+                anomaly!("double_spend_accepted");
+            }
+
+            // ── REORG: disconnect the spend then the mint → pool back to empty ─
+            chain.rewind_phase2_stores(2);
+            chain.rewind_phase2_stores(1);
+            if store.coin_count() != 0 || store.pool_value() != 0 {
+                anomaly!("reorg_did_not_restore_empty");
+            }
+            invariants!();
+        }
+
+        eprintln!(
+            "SHIELDED SOAK OK: {cycles} mint/spend/reorg cycles in {secs}s, seed={seed0}"
+        );
+        assert!(cycles > 0, "soak ran zero cycles");
+    }
+
     /// The verify hook rejects UNAUTHENTICATED coin entry: a shielded payload
     /// carrying bare `outputs` coins with no mint bundle (no per-coin value
     /// proof) must be rejected before any state changes.
