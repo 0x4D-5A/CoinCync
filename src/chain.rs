@@ -520,8 +520,14 @@ impl Blockchain {
             spark_store: None,
             shielded_store: None,
             kernel_store: None,
+            // Sketch-gk builds instantiate the canonical Spark pool store so the
+            // shielded verify/apply path and reorg lock-step run end-to-end
+            // (in-memory here; the persistent node uses `with_database`). Gated
+            // OFF in production, so default builds stay byte-identical.
             #[cfg(feature = "sketch-gk-proof")]
-            spark_pool_store: None,
+            spark_pool_store: Some(Arc::new(
+                crate::storage::spark_pool::SparkPoolStore::new(),
+            )),
             cut_through: None,
             security_log: Arc::new(crate::security::IncidentLog::default()),
             // CIP-009.D rolling finality: dormant until the operator
@@ -534,6 +540,15 @@ impl Blockchain {
 
     /// Create blockchain with database and network type
     pub fn with_database(db: Arc<Database>, network: NetworkType) -> Self {
+        // Open the persistent Spark pool store BEFORE `db` is moved into the
+        // struct. Gated `sketch-gk-proof`; a consensus store that cannot open is
+        // a hard fault (halt) rather than a silent None.
+        #[cfg(feature = "sketch-gk-proof")]
+        let spark_pool_store = Some(Arc::new(
+            crate::storage::spark_pool::SparkPoolStore::open_with_db(&db).unwrap_or_else(|e| {
+                panic!("failed to open SparkPoolStore (sketch-gk-proof build): {e}")
+            }),
+        ));
         Blockchain {
             apply_lock: parking_lot::Mutex::new(()),
             inner: RwLock::new(BlockchainInner {
@@ -566,8 +581,10 @@ impl Blockchain {
             spark_store: None,
             shielded_store: None,
             kernel_store: None,
+            // Persistent Spark pool store (opened above from `db`), gated
+            // `sketch-gk-proof`; None in production builds.
             #[cfg(feature = "sketch-gk-proof")]
-            spark_pool_store: None,
+            spark_pool_store,
             cut_through: None,
             security_log: Arc::new(crate::security::IncidentLog::default()),
             // CIP-009.D rolling finality: dormant until the operator
@@ -4338,6 +4355,59 @@ mod tests {
         chain.rewind_phase2_stores(1);
         chain.rewind_phase2_stores(0); // stacks already empty — no panic
         assert_eq!(roots(&chain), genesis_roots);
+    }
+
+    /// Increment #1 of the shielded-activation arc: the node constructor
+    /// instantiates the canonical Spark pool store (previously hard-`None`, so
+    /// the whole shielded verify/apply path no-op'd on a real node), it is
+    /// reorg-wired via the Phase-2 checkpoint driver, and it is persistent.
+    #[cfg(feature = "sketch-gk-proof")]
+    #[test]
+    fn node_instantiates_persistent_reorg_wired_spark_pool_store() {
+        use crate::db::Database;
+        use spark_connector::CoinBytes;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(Database::open(dir.path()).unwrap());
+
+        let chain = Blockchain::with_database(Arc::clone(&db), NetworkType::Regtest);
+        let store = chain
+            .spark_pool_store
+            .clone()
+            .expect("a sketch-gk-proof node must instantiate the Spark pool store");
+
+        // Reorg-wired: the chain's Phase-2 checkpoint driver advances it in
+        // lock-step (a no-op before, when the store was None).
+        let cp_before = store.checkpoint_count();
+        chain.checkpoint_phase2_stores(1);
+        assert_eq!(
+            store.checkpoint_count(),
+            cp_before + 1,
+            "the node's pool store must checkpoint in Phase-2 lock-step"
+        );
+
+        // Persistent: a coin added through the node's store survives a fresh
+        // node opened on the same database (open_with_db replay).
+        assert!(
+            store
+                .add_coin(b"outpoint-1".to_vec(), CoinBytes(vec![7u8; 40]), b"ctx".to_vec(), 1)
+                .is_some(),
+            "coin must be added"
+        );
+        assert_eq!(store.coin_count(), 1);
+        drop(store);
+        drop(chain);
+
+        let reopened = Blockchain::with_database(Arc::clone(&db), NetworkType::Regtest);
+        let reopened_store = reopened
+            .spark_pool_store
+            .clone()
+            .expect("reopened node must instantiate the store");
+        assert_eq!(
+            reopened_store.coin_count(),
+            1,
+            "the persisted coin must survive a node reopen (persistence wired)"
+        );
     }
 
     /// Integration of the COMPLETE shielded spend path through the chain's
