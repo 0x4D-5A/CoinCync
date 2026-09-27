@@ -339,6 +339,18 @@ impl SparkPoolStore {
         self.coins.read().len()
     }
 
+    /// Every pool coin as `(outpoint, coin bytes, serial_context, height)` in
+    /// cover-set order — what a wallet scan needs to test ownership (via
+    /// `SparkBackend::identify` on the coin bytes) and, for owned coins, key the
+    /// note by its outpoint + recover its serial context for a later spend.
+    pub fn coin_entries(&self) -> Vec<(Vec<u8>, CoinBytes, Vec<u8>, u64)> {
+        self.coins
+            .read()
+            .iter()
+            .map(|c| (c.outpoint.clone(), c.coin.clone(), c.serial_context.clone(), c.height))
+            .collect()
+    }
+
     /// The cover-set index of the coin at `outpoint`, if present.
     pub fn index_of(&self, outpoint: &[u8]) -> Option<u64> {
         self.by_outpoint.read().get(outpoint).copied()

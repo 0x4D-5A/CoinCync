@@ -421,6 +421,7 @@ int spark_ffi_address_from_seed(const unsigned char* seed, int seed_len, unsigne
 // ctor, so watch-only scanning needs a small upstream addition.)
 int spark_ffi_identify(const unsigned char* seed, int seed_len,
                        const unsigned char* coin_ptr, int coin_len,
+                       const unsigned char* ctx_ptr, int ctx_len,
                        uint64_t* out_value,
                        unsigned char* out_memo, int memo_cap, int* out_memo_len) {
     try {
@@ -433,6 +434,11 @@ int spark_ffi_identify(const unsigned char* seed, int seed_len,
         CDataStream in((const char*)coin_ptr, (const char*)coin_ptr + coin_len, SER_NETWORK, PROTOCOL_VERSION);
         in >> coin;
         coin.setParams(params);
+        // The serial context is not carried in the coin wire form; a scanner must
+        // supply the same context the coin was minted with (empty for the default).
+        // Both sides must agree, or identify fails to recognize the coin.
+        std::vector<unsigned char> serial_context(ctx_ptr, ctx_ptr + ctx_len);
+        coin.setSerialContext(serial_context);
 
         spark::IdentifiedCoinData id = coin.identify(incoming); // throws if not ours
         *out_value = id.v;

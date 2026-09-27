@@ -106,7 +106,18 @@ pub trait SparkBackend {
 
     /// Identify + recover an owned coin's value with an incoming/full view key.
     /// `Ok(None)` means "not ours". Never yields spend authority.
-    fn identify(&self, view_key: &[u8], coin: &CoinBytes) -> Result<Option<IdentifiedCoin>>;
+    ///
+    /// `serial_context` is the coin's deterministic serial context (as passed at
+    /// mint). It is NOT carried in the coin wire form, so a scanner must supply
+    /// the same context the coin was minted with; both sides must agree or the
+    /// coin fails to identify. Pass `&[]` for a coin minted with the empty
+    /// (default) context.
+    fn identify(
+        &self,
+        view_key: &[u8],
+        coin: &CoinBytes,
+        serial_context: &[u8],
+    ) -> Result<Option<IdentifiedCoin>>;
 
     /// Auditor-side **unspent-solvency** check. Verifies a shielded spend proof
     /// (Grootle membership + Chaum tag-binding + range/balance) and then
@@ -155,7 +166,7 @@ impl SparkBackend for StubBackend {
     fn verify_spend(&self, _c: &[CoinBytes], _s: &SpendBytes, _f: u64, _vb: i64) -> Result<Vec<Nullifier>> {
         Err(ConnectorError::NotWired)
     }
-    fn identify(&self, _v: &[u8], _c: &CoinBytes) -> Result<Option<IdentifiedCoin>> {
+    fn identify(&self, _v: &[u8], _c: &CoinBytes, _ctx: &[u8]) -> Result<Option<IdentifiedCoin>> {
         Err(ConnectorError::NotWired)
     }
 }
@@ -256,6 +267,8 @@ pub mod ffi {
             seed_len: c_int,
             coin_ptr: *const u8,
             coin_len: c_int,
+            ctx_ptr: *const u8,
+            ctx_len: c_int,
             out_value: *mut u64,
             out_memo: *mut u8,
             memo_cap: c_int,
@@ -644,8 +657,16 @@ pub mod ffi {
             Ok(out)
         }
         /// Scan a coin with a `view_key` (here the wallet seed; a true view-only
-        /// key path is a follow-up). `Ok(None)` means "not ours" — not an error.
-        fn identify(&self, view_key: &[u8], coin: &CoinBytes) -> Result<Option<IdentifiedCoin>> {
+        /// key path is a follow-up). `serial_context` must match the context the
+        /// coin was minted with (`&[]` for the empty default) — it is set on the
+        /// coin before recovery, since it is not carried in the wire form.
+        /// `Ok(None)` means "not ours" — not an error.
+        fn identify(
+            &self,
+            view_key: &[u8],
+            coin: &CoinBytes,
+            serial_context: &[u8],
+        ) -> Result<Option<IdentifiedCoin>> {
             let mut value: u64 = 0;
             let mut memo = vec![0u8; 256];
             let mut memo_len: c_int = 0;
@@ -656,6 +677,8 @@ pub mod ffi {
                     view_key.len() as c_int,
                     coin.0.as_ptr(),
                     coin.0.len() as c_int,
+                    serial_context.as_ptr(),
+                    serial_context.len() as c_int,
                     &mut value,
                     memo.as_mut_ptr(),
                     memo.len() as c_int,
@@ -730,13 +753,13 @@ pub mod ffi {
             let coin = b.create_output(&addr, 777, b"hello").expect("create_output");
 
             // Owner scans -> recovers value + memo.
-            let owned = b.identify(seed, &coin).expect("identify call").expect("coin is ours");
+            let owned = b.identify(seed, &coin, &[]).expect("identify call").expect("coin is ours");
             assert_eq!(owned.value, 777);
             assert_eq!(owned.memo, b"hello");
 
             // A different wallet does not recognize it.
             assert!(
-                b.identify(b"wallet-seed-beta", &coin).unwrap().is_none(),
+                b.identify(b"wallet-seed-beta", &coin, &[]).unwrap().is_none(),
                 "a foreign wallet must not identify the coin"
             );
         }
@@ -965,7 +988,7 @@ mod tests {
             b.verify_spend(&[], &SpendBytes(vec![]), 0, 0).unwrap_err(),
             ConnectorError::NotWired
         );
-        assert_eq!(b.identify(&[], &CoinBytes(vec![])).unwrap_err(), ConnectorError::NotWired);
+        assert_eq!(b.identify(&[], &CoinBytes(vec![]), &[]).unwrap_err(), ConnectorError::NotWired);
     }
 
     #[test]
@@ -973,7 +996,7 @@ mod tests {
         // The consensus/wallet hold a `&dyn SparkBackend`, so the trait must be
         // object-safe; this is a compile-time assertion of that.
         let b: Box<dyn SparkBackend> = Box::new(StubBackend);
-        assert!(b.identify(&[], &CoinBytes(vec![1, 2, 3])).is_err());
+        assert!(b.identify(&[], &CoinBytes(vec![1, 2, 3]), &[]).is_err());
     }
 
     #[test]

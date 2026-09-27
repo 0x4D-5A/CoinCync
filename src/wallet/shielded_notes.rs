@@ -1,0 +1,186 @@
+//! Wallet-side shielded (Spark) note tracking — the receive + spend-select half
+//! of shielded wallet integration.
+//!
+//! A wallet SCANS the on-chain Spark pool to find coins it OWNS (via the
+//! libspark `identify` primitive), tracks them as [`OwnedNote`]s, reports a
+//! shielded balance, and SELECTS notes to fund a spend (whose outpoints feed
+//! `consensus::spark_payload::build::build_spend_payload`).
+//!
+//! HONEST SCOPE / gating:
+//! - Gated `sketch-gk-proof` + `libspark-ffi` (needs the pool store + the real
+//!   libspark backend); never compiled in a production build (shielded is off
+//!   there — activation is `u64::MAX`).
+//! - Scanning uses the wallet SEED (full authority), not a true view-only key.
+//!   A *view-only* shielded scan is BLOCKED on an upstream libspark
+//!   `IncomingViewKey` reconstruction ctor (see `docs/design/cip-shielded-notes.md`);
+//!   the native `SparkScanKey` belongs to the retired native-GK engine and
+//!   cannot detect a libspark bound-coin.
+//! - Spent-tracking is LOCAL ([`ShieldedNoteStore::mark_spent`] on our own
+//!   spend). A full sync that cross-checks the pool's spent-tag set needs each
+//!   note's linking tag (seed-derivable) — a follow-up.
+
+use spark_connector::ffi::LibsparkBackend;
+use spark_connector::{CoinBytes, SparkBackend};
+
+use crate::storage::spark_pool::SparkPoolStore;
+
+/// A shielded coin this wallet owns.
+#[derive(Clone, Debug)]
+pub struct OwnedNote {
+    /// The coin's chain outpoint — its key in the pool and what a spend targets.
+    pub outpoint: Vec<u8>,
+    /// Authenticated value (recovered via `identify`).
+    pub value: u64,
+    /// The libspark coin bytes.
+    pub coin: CoinBytes,
+    /// The deterministic serial context the coin was minted with (needed to
+    /// recover its spend witness).
+    pub serial_context: Vec<u8>,
+    /// Mint height.
+    pub height: u64,
+    /// Locally marked spent (this wallet spent it this session).
+    pub spent: bool,
+}
+
+/// The wallet's set of owned shielded notes.
+#[derive(Clone, Debug, Default)]
+pub struct ShieldedNoteStore {
+    notes: Vec<OwnedNote>,
+}
+
+impl ShieldedNoteStore {
+    pub fn new() -> Self {
+        Self { notes: Vec::new() }
+    }
+
+    /// Scan the pool for coins owned by `seed`, adding any not already tracked.
+    /// Returns the number of NEW owned notes found. Idempotent — re-scanning
+    /// does not duplicate. Uses the libspark backend's `identify` (seed-derived
+    /// view key) on each pool coin.
+    pub fn scan(&mut self, seed: &[u8], pool: &SparkPoolStore) -> usize {
+        let backend = LibsparkBackend;
+        let mut found = 0;
+        for (outpoint, coin, serial_context, height) in pool.coin_entries() {
+            if self.notes.iter().any(|n| n.outpoint == outpoint) {
+                continue; // already tracked
+            }
+            if let Ok(Some(id)) = backend.identify(seed, &coin, &serial_context) {
+                self.notes.push(OwnedNote {
+                    outpoint,
+                    value: id.value,
+                    coin,
+                    serial_context,
+                    height,
+                    spent: false,
+                });
+                found += 1;
+            }
+        }
+        found
+    }
+
+    /// Unspent owned notes.
+    pub fn unspent(&self) -> impl Iterator<Item = &OwnedNote> {
+        self.notes.iter().filter(|n| !n.spent)
+    }
+
+    /// Total unspent shielded balance.
+    pub fn balance(&self) -> u64 {
+        self.unspent().map(|n| n.value).sum()
+    }
+
+    /// Number of tracked notes (spent + unspent).
+    pub fn len(&self) -> usize {
+        self.notes.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.notes.is_empty()
+    }
+
+    /// Select unspent notes whose values sum to at least `target` (greedy,
+    /// largest-first). Returns the selected notes' outpoints, or `None` if the
+    /// unspent balance is insufficient.
+    pub fn select_for_spend(&self, target: u64) -> Option<Vec<Vec<u8>>> {
+        if self.balance() < target {
+            return None;
+        }
+        let mut notes: Vec<&OwnedNote> = self.unspent().collect();
+        notes.sort_by(|a, b| b.value.cmp(&a.value)); // largest first
+        let mut acc = 0u64;
+        let mut chosen = Vec::new();
+        for n in notes {
+            if acc >= target {
+                break;
+            }
+            acc = acc.saturating_add(n.value);
+            chosen.push(n.outpoint.clone());
+        }
+        Some(chosen)
+    }
+
+    /// Mark the note at `outpoint` spent (call after this wallet spends it).
+    /// Returns true if a matching unspent note was found.
+    pub fn mark_spent(&mut self, outpoint: &[u8]) -> bool {
+        for n in self.notes.iter_mut() {
+            if n.outpoint == outpoint && !n.spent {
+                n.spent = true;
+                return true;
+            }
+        }
+        false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::consensus::spark_payload::derive_outpoint;
+    use spark_connector::ffi::{build_mint_bundle, serial_context, verify_mint_bundle};
+
+    /// Mint an authenticated bundle to `seed` and feed the pool exactly as the
+    /// chain's apply hook does (shared tx-level context, keyed by per-vout
+    /// outpoint).
+    fn mint_to_pool(pool: &SparkPoolStore, seed: &[u8], values: &[u64]) {
+        let ctx = serial_context(&derive_outpoint(&[], 0)).unwrap();
+        let bundle = build_mint_bundle(seed, values, &ctx).unwrap();
+        let (_total, coins) = verify_mint_bundle(&bundle).unwrap();
+        for (i, coin) in coins.iter().enumerate() {
+            let op = derive_outpoint(&[], i as u32);
+            assert!(pool.add_coin(op, coin.clone(), ctx.clone(), 1).is_some());
+        }
+    }
+
+    #[test]
+    fn scan_owns_reports_balance_and_selects() {
+        let pool = SparkPoolStore::new();
+        let seed_a = b"wallet-seed-a";
+        let seed_b = b"wallet-seed-b";
+        mint_to_pool(&pool, seed_a, &[1_000, 2_000, 3_000]);
+
+        // Wallet A finds + values its three coins.
+        let mut a = ShieldedNoteStore::new();
+        assert_eq!(a.scan(seed_a, &pool), 3, "wallet A owns its 3 minted coins");
+        assert_eq!(a.balance(), 6_000);
+        assert_eq!(a.len(), 3);
+        // Re-scan is idempotent (no duplicates).
+        assert_eq!(a.scan(seed_a, &pool), 0);
+        assert_eq!(a.balance(), 6_000);
+
+        // Wallet B owns none of A's coins.
+        let mut b = ShieldedNoteStore::new();
+        assert_eq!(b.scan(seed_b, &pool), 0);
+        assert_eq!(b.balance(), 0);
+
+        // Spend-selection: enough → some outpoints; too much → None.
+        let sel = a.select_for_spend(2_500).expect("6000 >= 2500");
+        assert!(!sel.is_empty());
+        assert!(a.select_for_spend(10_000).is_none(), "insufficient balance");
+
+        // Marking a selected note spent drops the balance and is one-shot.
+        let op0 = sel[0].clone();
+        assert!(a.mark_spent(&op0));
+        assert!(a.balance() < 6_000);
+        assert!(!a.mark_spent(&op0), "already spent");
+    }
+}
