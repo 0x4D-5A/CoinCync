@@ -85,10 +85,19 @@ re-verify cryptography.
 
 ### peer-set (operational only — node-local, never consensus)
 - **Catches:** isolation (0 peers) and under-connection (`< 3`) — partition /
-  eclipse risk → page.
-- **Does NOT catch:** a *well-connected but all-adversarial* peer set (a sybil
-  eclipse where the count looks healthy); traffic analysis; the *content* peers
-  send (validation handles that). Never halts.
+  eclipse risk → page. **Netgroup diversity** (added 2026-09-26,
+  `peer_diversity`): a peer set whose *count* looks healthy but is concentrated
+  in few `/16` netgroups — all peers in one `/16` → Critical, a single `/16`
+  holding a strict majority (≥ 4 peers) → Warning. Same
+  [`eviction::netgroup`] keying (IPv4 `/16`, IPv6 `/32`) as the connection-level
+  eclipse defenses. This partially closes the "well-connected but
+  all-adversarial (count looks healthy)" gap for the common *single-subnet*
+  sybil.
+- **Does NOT catch:** a sybil *spread across many `/16`s* (a resourced adversary
+  renting diverse subnets / ASNs — `/16` grouping is coarser than ASN, which
+  needs an external GeoIP DB not pulled in for testnet); traffic analysis; the
+  *content* peers send (validation handles that). Still operational — never
+  halts.
 
 ## Systemic limits — the honest ~1%
 1. **Unsound crypto that verifies.** No monitor catches a broken proof accepted

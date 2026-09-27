@@ -560,8 +560,13 @@ pub(super) fn register(module: &mut RpcModule<RpcState>) -> Result<()> {
             }
             if let Some(p2p) = &state.p2p {
                 use crate::security::SecurityDetail;
-                let peers = p2p.peer_count();
-                live.merge(crate::network::peer_security::PeerSecurityDetail::new(peers).sweep());
+                // Pass the connected peer addresses so the detail runs BOTH the
+                // count signal and the netgroup-diversity (sybil-eclipse) signal.
+                let addrs: Vec<std::net::SocketAddr> =
+                    p2p.connected_peers().iter().map(|p| p.addr).collect();
+                live.merge(
+                    crate::network::peer_security::PeerSecurityDetail::with_peers(addrs).sweep(),
+                );
             }
             let live_alerts: Vec<serde_json::Value> = live
                 .alerts
