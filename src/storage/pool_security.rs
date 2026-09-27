@@ -38,6 +38,9 @@ pub enum GuardViolation {
     TagSpentInTheFuture { tip: u64, max_tag_height: u64 },
     /// The reorg checkpoint stack exceeded its bound (desync / leak).
     CheckpointStackOverflow { count: usize, max: usize },
+    /// The shielded pool value went NEGATIVE — more was unshielded than was ever
+    /// shielded in (inflation across the veil). Must never happen honestly.
+    PoolValueNegative { pool_value: i128 },
 }
 
 /// Soft anomaly flags from a surveillance scan — worth a look, not proof.
@@ -136,6 +139,11 @@ impl SecretService {
         let cps = store.checkpoint_count();
         if cps > MAX {
             v.push(GuardViolation::CheckpointStackOverflow { count: cps, max: MAX });
+        }
+        // No inflation across the veil: the pool value can never be negative.
+        let pv = store.pool_value();
+        if pv < 0 {
+            v.push(GuardViolation::PoolValueNegative { pool_value: pv });
         }
         v
     }
@@ -243,6 +251,10 @@ impl crate::security::SecurityDetail for PoolSecurityDetail<'_> {
                 GuardViolation::CheckpointStackOverflow { count, max } => (
                     "checkpoint-overflow",
                     format!("reorg checkpoint stack {count} exceeds bound {max}"),
+                ),
+                GuardViolation::PoolValueNegative { pool_value } => (
+                    "pool-underflow",
+                    format!("shielded pool value {pool_value} < 0 — inflation across the veil"),
                 ),
             };
             // Guards are deterministic + O(1) → consensus-critical (safe to halt).

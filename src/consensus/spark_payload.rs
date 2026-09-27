@@ -299,16 +299,17 @@ pub mod build {
     use super::*;
     use spark_connector::ffi::{build_spend_over_set, mint_to_seed, serial_context};
 
-    /// Build a mint-side payload: one coin per value, minted to the `seed`
-    /// wallet and bound to the deterministic context
-    /// `serial_context(derive_outpoint(tx_input_outpoints, vout))`. Returns the
-    /// payload plus the per-output contexts the apply feed stores. `None` on any
-    /// FFI failure.
+    /// Build a mint-side (shield-in) payload: one coin per value, minted to the
+    /// `seed` wallet and bound to the deterministic context
+    /// `serial_context(derive_outpoint(tx_input_outpoints, vout))`. The payload's
+    /// `value_balance` is set to `-(Σ values)` — a shield-IN is NEGATIVE (value
+    /// entering the pool), the sign the pool-value accounting and
+    /// `verify_mint_shield_in` require. Returns the payload plus the per-output
+    /// contexts the apply feed stores. `None` on any FFI failure.
     pub fn build_mint_payload(
         seed: &[u8],
         values: &[u64],
         tx_input_outpoints: &[Vec<u8>],
-        value_balance: i64,
     ) -> Option<(SparkPayload, Vec<Vec<u8>>)> {
         let mut outputs = Vec::with_capacity(values.len());
         let mut contexts = Vec::with_capacity(values.len());
@@ -319,10 +320,12 @@ pub mod build {
             outputs.push(coin.0);
             contexts.push(ctx);
         }
+        // Shield-in: value entering the pool is NEGATIVE value_balance.
+        let value_balance = -(values.iter().sum::<u64>() as i64);
         Some((
             SparkPayload {
                 version: SPARK_PAYLOAD_VERSION,
-            mint: None,
+                mint: None,
                 outputs,
                 spend: None,
                 value_balance,
@@ -629,9 +632,8 @@ mod tests {
         // Mint N coins via the builder, funded by a synthetic transparent input.
         let mint_inputs = vec![vec![0xEEu8; 36]];
         let values: Vec<u64> = (0..n as u64).map(|i| 10_000 + i).collect();
-        let vb: i64 = values.iter().sum::<u64>() as i64;
         let (mint_payload, contexts) =
-            build_mint_payload(seed, &values, &mint_inputs, vb).expect("build mint payload");
+            build_mint_payload(seed, &values, &mint_inputs).expect("build mint payload");
 
         // Apply the mint payload → feeds the pool at height 1.
         apply_spark_payload(&store, &mint_payload, &mint_inputs, &contexts, &[], 1)

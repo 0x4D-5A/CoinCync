@@ -69,7 +69,13 @@ struct PersistedCoin {
 struct SparkPoolPersistence {
     coins: shim::Tree,
     tags: shim::Tree,
+    /// Small metadata CF: the running pool value survives restart (key
+    /// `POOL_VALUE_KEY`, an i128 in little-endian).
+    meta: shim::Tree,
 }
+
+/// Persistence key for the running pool value in the meta CF.
+const POOL_VALUE_KEY: &[u8] = b"pool_value";
 
 /// One coin in the pool: its libspark serialization plus the metadata needed to
 /// re-derive its spend witness (the deterministic serial context) and to place
@@ -98,6 +104,9 @@ pub struct SparkPoolCoin {
 struct PoolCheckpoint {
     height: u64,
     coins_len: usize,
+    /// Pool value (`Σ value_balance`) at the boundary, so a reorg restores the
+    /// exact pre-block total.
+    pool_value: i128,
 }
 
 /// The libspark-aligned Spark pool store. In-memory; see module docs for the
@@ -117,6 +126,11 @@ pub struct SparkPoolStore {
     /// Updated on add/mark; recomputed on the (rare) rewind.
     max_coin_height: RwLock<Option<u64>>,
     max_spent_tag_height: RwLock<Option<u64>>,
+    /// The running shielded pool value: `Σ value_balance` applied, where a
+    /// shield-in (`value_balance < 0`) grows it and an unshield-out shrinks it.
+    /// The "no inflation across the veil" invariant is `pool_value >= 0` — you
+    /// cannot unshield more than was ever shielded in. Persisted + reorg-aware.
+    pool_value: RwLock<i128>,
     /// RocksDB-backed persistence. `None` for in-memory tests.
     persistence: Option<SparkPoolPersistence>,
 }
@@ -131,6 +145,7 @@ impl SparkPoolStore {
             checkpoints: RwLock::new(Vec::new()),
             max_coin_height: RwLock::new(None),
             max_spent_tag_height: RwLock::new(None),
+            pool_value: RwLock::new(0),
             persistence: None,
         }
     }
@@ -142,6 +157,7 @@ impl SparkPoolStore {
     pub fn open_with_db(database: &Database) -> Result<Self> {
         let coins_tree = database.open_tree("spark_pool_coins")?;
         let tags_tree = database.open_tree("spark_pool_tags")?;
+        let meta_tree = database.open_tree("spark_pool_meta")?;
 
         // Collect + sort coins by cover_index (the BE-encoded key).
         let mut loaded: Vec<(u64, PersistedCoin)> = Vec::new();
@@ -182,6 +198,16 @@ impl SparkPoolStore {
 
         let max_coin_height = coins.iter().map(|c| c.height).max();
         let max_spent_tag_height = spent_tags.values().copied().max();
+
+        // Restore the running pool value (i128 LE); default 0 if unset.
+        let pool_value = meta_tree
+            .get(POOL_VALUE_KEY)
+            .ok()
+            .flatten()
+            .and_then(|v| <[u8; 16]>::try_from(v.as_ref()).ok())
+            .map(i128::from_le_bytes)
+            .unwrap_or(0);
+
         Ok(Self {
             coins: RwLock::new(coins),
             by_outpoint: RwLock::new(by_outpoint),
@@ -189,9 +215,11 @@ impl SparkPoolStore {
             checkpoints: RwLock::new(Vec::new()),
             max_coin_height: RwLock::new(max_coin_height),
             max_spent_tag_height: RwLock::new(max_spent_tag_height),
+            pool_value: RwLock::new(pool_value),
             persistence: Some(SparkPoolPersistence {
                 coins: coins_tree,
                 tags: tags_tree,
+                meta: meta_tree,
             }),
         })
     }
@@ -344,6 +372,36 @@ impl SparkPoolStore {
         self.coins.read().iter().filter(|c| c.height >= height).count()
     }
 
+    /// Apply one shielded tx's `value_balance` to the running pool total: a
+    /// shield-in (`value_balance < 0`) grows it, an unshield-out (`> 0`) shrinks
+    /// it. Returns `Err` (and leaves the total unchanged) if it would drive the
+    /// pool NEGATIVE — an attempt to unshield more than was ever shielded in
+    /// ("no inflation across the veil"). Persists the new total. Reorg-safe: a
+    /// checkpoint snapshots the pre-block total and `rewind` restores it.
+    pub fn apply_value_balance(&self, value_balance: i64) -> Result<()> {
+        let mut pv = self.pool_value.write();
+        // total_after = total − value_balance (value_balance > 0 removes value).
+        let after = *pv - value_balance as i128;
+        if after < 0 {
+            return Err(Error::InvalidTransaction(format!(
+                "shielded pool underflow: pool {} − value_balance {} = {} < 0 \
+                 (cannot unshield more than the pool holds)",
+                *pv, value_balance, after
+            )));
+        }
+        *pv = after;
+        if let Some(p) = &self.persistence {
+            let _ = p.meta.insert(POOL_VALUE_KEY, after.to_le_bytes());
+        }
+        Ok(())
+    }
+
+    /// The current shielded pool value (`Σ value_balance`). The invariant is
+    /// `>= 0`; the security detail guards it.
+    pub fn pool_value(&self) -> i128 {
+        *self.pool_value.read()
+    }
+
     /// A snapshot of the spent VRF-tag set — passed straight to
     /// `SparkBackend::verify_solvency` as the `spent_tags` the proof's revealed
     /// tag must NOT be in.
@@ -361,8 +419,9 @@ impl SparkPoolStore {
     /// the cap), matching the sibling stores.
     pub fn checkpoint_at_height(&self, height: u64) {
         let coins_len = self.coins.read().len();
+        let pool_value = *self.pool_value.read();
         let mut cps = self.checkpoints.write();
-        cps.push(PoolCheckpoint { height, coins_len });
+        cps.push(PoolCheckpoint { height, coins_len, pool_value });
         if cps.len() > MAX_CHECKPOINTS {
             cps.remove(0);
         }
@@ -440,6 +499,13 @@ impl SparkPoolStore {
         // rare, so an O(n) recompute here is fine; the hot path stays O(1)).
         *self.max_coin_height.write() = self.coins.read().iter().map(|c| c.height).max();
         *self.max_spent_tag_height.write() = self.spent_tags.read().values().copied().max();
+
+        // Restore the pool value to the disconnected block's pre-apply boundary
+        // and mirror it to disk, so a reorg (and a later replay) is exact.
+        *self.pool_value.write() = restore.pool_value;
+        if let Some(p) = &self.persistence {
+            let _ = p.meta.insert(POOL_VALUE_KEY, restore.pool_value.to_le_bytes());
+        }
         true
     }
 }
@@ -563,6 +629,52 @@ mod tests {
         // A tag in the set is "already spent"; one not in it is unspent.
         assert!(tags.contains(&nf(0xAB)));
         assert!(!tags.contains(&nf(0xCD)));
+    }
+
+    #[test]
+    fn pool_value_shield_unshield_and_underflow() {
+        let s = SparkPoolStore::new();
+        assert_eq!(s.pool_value(), 0);
+        // Shield 100 in (value_balance = -100) → pool 100.
+        s.apply_value_balance(-100).unwrap();
+        assert_eq!(s.pool_value(), 100);
+        // Unshield 40 out → pool 60.
+        s.apply_value_balance(40).unwrap();
+        assert_eq!(s.pool_value(), 60);
+        // Unshield 100 (more than held) → rejected, pool unchanged.
+        assert!(s.apply_value_balance(100).is_err(), "cannot unshield more than the pool holds");
+        assert_eq!(s.pool_value(), 60, "rejected apply leaves the total unchanged");
+    }
+
+    #[test]
+    fn pool_value_rewinds_with_reorg() {
+        let s = SparkPoolStore::new();
+        s.checkpoint_at_height(1);
+        s.apply_value_balance(-100).unwrap(); // block 1 shields 100 → pool 100
+        s.checkpoint_at_height(2);
+        s.apply_value_balance(-50).unwrap(); // block 2 shields 50 → pool 150
+        assert_eq!(s.pool_value(), 150);
+        // Disconnect block 2 → pool back to its pre-block-2 boundary (100).
+        assert!(s.rewind());
+        assert_eq!(s.pool_value(), 100);
+        // Disconnect block 1 → back to 0.
+        assert!(s.rewind());
+        assert_eq!(s.pool_value(), 0);
+    }
+
+    #[test]
+    fn pool_value_persists_across_reopen() {
+        use crate::db::Database;
+        let dir = tempfile::tempdir().unwrap();
+        let db = std::sync::Arc::new(Database::open(dir.path()).unwrap());
+        {
+            let s = SparkPoolStore::open_with_db(&db).unwrap();
+            s.apply_value_balance(-250).unwrap(); // shield 250 in
+            assert_eq!(s.pool_value(), 250);
+        }
+        // Reopen: the pool value replays from the meta CF.
+        let re = SparkPoolStore::open_with_db(&db).unwrap();
+        assert_eq!(re.pool_value(), 250, "pool value survives restart");
     }
 
     #[test]

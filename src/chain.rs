@@ -823,6 +823,10 @@ impl Blockchain {
         };
         let backend = spark_connector::ffi::LibsparkBackend;
         let mut seen_tags: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+        // Simulate the pool value across the block to reject (pre-apply) any
+        // block that would unshield more than the pool holds — prevention of
+        // inflation across the veil, before any state is mutated.
+        let mut simulated_pool = store.pool_value();
         for (idx, tx) in transactions.iter().enumerate() {
             if !tx.is_shielded() {
                 continue;
@@ -846,6 +850,14 @@ impl Blockchain {
                 payload.value_balance,
             )
             .map_err(|e| format!("spark v2 tx {idx}: value bridge: {e}"))?;
+            // Cumulative pool-value check (prevention): reject before apply if
+            // this tx would unshield more than the pool holds.
+            simulated_pool -= payload.value_balance as i128;
+            if simulated_pool < 0 {
+                return Err(format!(
+                    "spark v2 tx {idx}: pool underflow — unshields more than the shielded pool holds"
+                ));
+            }
             // Authenticated shield-in: the minted coins' total value proof must
             // equal the value entering the pool (−value_balance). Together with
             // the bridge above this fully conserves value across the veil.
@@ -977,6 +989,17 @@ impl Blockchain {
                     }
                 }
             }
+
+            // Move this tx's value across the veil in the pool total (shield-in
+            // grows it, unshield shrinks it). A negative result is impossible —
+            // verify_block_spark_v2 pre-checked cumulative balance — so an Err
+            // here is a consensus fault → halt (preserve on-disk state).
+            store.apply_value_balance(payload.value_balance).unwrap_or_else(|e| {
+                panic!(
+                    "CONSENSUS FAULT: spark v2 pool-value apply failed (tx {idx}, h{height}): {e}. \
+                     Validation should have rejected. Halting."
+                )
+            });
         }
 
         // Secret Service, post-apply: run the pool's O(1) consensus guard over
@@ -4421,10 +4444,10 @@ mod tests {
         let seed = b"chain-hook-seed";
         let n = cover_set_size().unwrap();
         let values: Vec<u64> = (0..n as u64).map(|i| 10_000 + i).collect();
-        let vb: i64 = values.iter().sum::<u64>() as i64;
         // Mint payload built against an EMPTY transparent input set (matches the
-        // tx's empty inputs, so the hook re-derives identical outpoints).
-        let (mint_payload, _ctx) = build_mint_payload(seed, &values, &[], vb).unwrap();
+        // tx's empty inputs, so the hook re-derives identical outpoints). The
+        // builder sets value_balance = -(Σ values) (shield-in).
+        let (mint_payload, _ctx) = build_mint_payload(seed, &values, &[]).unwrap();
         let mint_tx = mk_shielded_tx(mint_payload.encode());
 
         // The mint FEED hook: applies the v2 payload → pool gains N coins.
