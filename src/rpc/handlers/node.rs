@@ -134,6 +134,11 @@ pub(super) fn register(module: &mut RpcModule<RpcState>) -> Result<()> {
                 // Chain tip
                 "height":                  height,
                 "target_height":           target_height,
+                // Raw peer-advertised height (0 if no peer info yet). The rig's
+                // fork-divergence gate reads this to detect a node that has
+                // mined ahead of the network onto a private branch; without it
+                // the gate silently never fires (issue #131).
+                "peer_target_height":      state.chain.peer_advertised_height(),
                 "top_hash":                hex::encode(tip.hash.as_bytes()),
                 // Back-compat alias: some older clients look for `tip_hash`.
                 "tip_hash":                hex::encode(tip.hash.as_bytes()),
