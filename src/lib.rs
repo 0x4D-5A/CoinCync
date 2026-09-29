@@ -103,6 +103,7 @@ pub mod security; // chain-wide "security detail" pattern: guards + scan over at
 // ── Network genesis definitions ─────────────────────────────
 pub mod mainnet;
 pub mod testnet;
+pub mod beta;
 
 // ── Re-exports ──────────────────────────────────────────────
 pub use config::{Network, NodeConfig};
