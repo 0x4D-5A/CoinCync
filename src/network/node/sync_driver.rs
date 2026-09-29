@@ -46,14 +46,19 @@
 //!   thousands of times without ever clearing a stuck sync.
 //!   TESTS: (gap — no unit or integration test drives the tick-loop
 //!   escalation counters directly).
-//! - **§5 `send_block_spans` peer-ahead filter (P-3 fix)** — INVARIANT:
-//!   block-hash spans are only distributed to peers whose advertised
-//!   height is strictly greater than local height.
-//!   THREAT: 2026-08-16 — a same-height stuck follower peer received part
-//!   of the request span, answered empty, and IBD wedged permanently with
-//!   no recovery tier able to clear it.
-//!   TESTS: (gap — no test exercises `send_block_spans`'s peer-height
-//!   filter; would need a peer/sender harness).
+//! - **§5 `send_block_spans` peer eligibility (P-3 + #126)** — INVARIANT:
+//!   block-hash spans are distributed only to peers that are either strictly
+//!   TALLER than local height OR advertise strictly greater cumulative WORK
+//!   than our tip (`ChainSync::work_heavier_peers`); a peer that is neither is
+//!   never sent a span.
+//!   THREAT: (P-3, 2026-08-16) a same-height stuck follower received part of
+//!   the span, answered empty, and IBD wedged permanently with no recovery
+//!   tier able to clear it. (#126, 2026-09-28) a peer on a shorter-but-heavier
+//!   fork holds exactly the fork blocks needed to reorg, but a pure height gate
+//!   filtered it out, so the queued fork hashes were never requested from
+//!   anyone and the node wedged below the heavier tip.
+//!   TESTS: `send_block_spans_admits_work_heavier_shorter_peer_126`,
+//!   `send_block_spans_rejects_equal_height_equal_work_peer`.
 //! - **§6 `live_block_peers` / `remove_dead_senders`** — INVARIANT: only
 //!   peers that are `Connected`, have an open (non-closed) sender channel,
 //!   and are not `GetBlocks`-banned by the scorer are offered as IBD block
@@ -732,18 +737,30 @@ async fn send_block_spans(
     now: u64,
     local_height: u64,
 ) -> usize {
-    // P-3 fix (2026-08-16): only request blocks from peers strictly AHEAD of
-    // our tip. A peer at or below our height cannot serve the blocks we're
-    // missing; the old code split the request span across ALL live peers by
-    // index and ignored `peer_height`, so in a relay topology a same-height
-    // stuck follower received half the gap (e.g. the one block that would
-    // cascade-connect the orphan stash), answered empty, and IBD wedged
-    // permanently — no recovery tier cleared it. Bitcoin Core likewise only
-    // downloads from peers whose announced chain extends beyond ours.
+    // P-3 fix (2026-08-16): request blocks from peers strictly AHEAD of our
+    // tip. A taller peer's chain extends beyond ours; the old code split the
+    // request span across ALL live peers by index and ignored `peer_height`, so
+    // in a relay topology a same-height stuck follower received half the gap
+    // (e.g. the one block that would cascade-connect the orphan stash), answered
+    // empty, and IBD wedged permanently — no recovery tier cleared it. Bitcoin
+    // Core likewise downloads from peers whose announced chain extends ours.
+    //
+    // #126 fix (2026-09-28): height alone is NOT sufficient. A competing branch
+    // that forks BELOW our tip with higher cumulative WORK but equal/lower
+    // HEIGHT is the better chain, yet a pure height gate filters out its only
+    // source peer — so the fork hashes we already discovered and queued are
+    // never requested from anyone and the node wedges (the below-tip
+    // heavier-fork case; chain-layer reorg is sound, this is the delivery gap).
+    // Also admit peers advertising strictly greater cumulative work than our
+    // tip. `work_heavier_peers` is vetted (bogus-over-claim cap + TTL +
+    // substantiation), and an admitted peer that cannot deliver is re-queued and
+    // de-scored exactly as a taller one is — so this widens eligibility without
+    // weakening the P-3 guarantee (taller peers remain eligible unconditionally).
+    let work_heavier = { sync.read().await.work_heavier_peers() };
     let ahead: Vec<(PeerId, u64)> = peers
         .iter()
         .copied()
-        .filter(|(_, h)| *h > local_height)
+        .filter(|(id, h)| *h > local_height || work_heavier.contains(id))
         .collect();
     if ahead.is_empty() {
         return 0;
@@ -839,5 +856,78 @@ mod tests {
         state.emergency_t3_fires = 1;
         assert!(!state.emergency_recovery_due(419, false));
         assert!(state.emergency_recovery_due(420, false));
+    }
+
+    fn sync_at(height: u64, local_work: u128) -> ChainSync {
+        let mut s = ChainSync::new(height, Hash::zero());
+        s.set_local_total_difficulty(local_work);
+        s
+    }
+
+    // §5 / #126: a peer at the SAME height as us (not taller) but advertising
+    // strictly greater cumulative WORK is a shorter-but-heavier fork source and
+    // MUST be sent a block span. Before the fix the strict height gate dropped
+    // it and `send_block_spans` returned 0 — the below-tip heavier-fork wedge.
+    #[tokio::test]
+    async fn send_block_spans_admits_work_heavier_shorter_peer_126() {
+        let mut cs = sync_at(100, 1_000);
+        let peer: PeerId = [7u8; 32];
+        cs.update_peer_difficulty_for(peer, 2_000); // work 2_000 > local 1_000
+        assert!(
+            cs.work_heavier_peers().contains(&peer),
+            "a peer heavier than local work must be tracked as work-heavier"
+        );
+        let sync = RwLock::new(cs);
+
+        let senders: DashMap<PeerId, mpsc::Sender<Vec<u8>>> = DashMap::new();
+        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(4);
+        senders.insert(peer, tx);
+
+        let hashes = vec![
+            Hash::from_bytes([1u8; 32]),
+            Hash::from_bytes([2u8; 32]),
+            Hash::from_bytes([3u8; 32]),
+        ];
+        // peer height (100) == local height (100): NOT taller. Only work admits it.
+        let peers = [(peer, 100u64)];
+
+        let sent =
+            send_block_spans(&hashes, &peers, &senders, &sync, [0xC0, 0x15, 0x11, 0x00], 1_000, 100)
+                .await;
+
+        assert_eq!(
+            sent,
+            hashes.len(),
+            "all queued hashes must be requested from the work-heavier peer"
+        );
+        assert!(
+            rx.try_recv().is_ok(),
+            "a GetBlocks span must be delivered to the work-heavier peer"
+        );
+    }
+
+    // §5 control (P-3 preserved): a peer that is neither taller NOR work-heavier
+    // is still filtered out — the #126 fix widens eligibility, it does not open
+    // the floodgates to same-height, same-work followers.
+    #[tokio::test]
+    async fn send_block_spans_rejects_equal_height_equal_work_peer() {
+        let cs = sync_at(100, 1_000); // no peer work claim recorded
+        let peer: PeerId = [9u8; 32];
+        assert!(!cs.work_heavier_peers().contains(&peer));
+        let sync = RwLock::new(cs);
+
+        let senders: DashMap<PeerId, mpsc::Sender<Vec<u8>>> = DashMap::new();
+        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(4);
+        senders.insert(peer, tx);
+
+        let hashes = vec![Hash::from_bytes([1u8; 32])];
+        let peers = [(peer, 100u64)]; // same height, no work claim
+
+        let sent =
+            send_block_spans(&hashes, &peers, &senders, &sync, [0xC0, 0x15, 0x11, 0x00], 1_000, 100)
+                .await;
+
+        assert_eq!(sent, 0, "an equal-height, equal-work peer must not be sent a span");
+        assert!(rx.try_recv().is_err(), "no GetBlocks should be emitted");
     }
 }
