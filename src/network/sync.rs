@@ -248,10 +248,12 @@ pub struct ChainSync {
     // Phase 2a (V3 partial): per-peer total cumulative difficulty.
     // Populated by `update_peer_difficulty_for`, called when we observe
     // a block (announce or response) from `peer` with a known total work.
-    // Currently advisory — peer selection still uses height. Phase 2b
-    // (v1.0.12 protocol bump) will introduce a wire-format handshake
-    // field carrying this value at connection time, at which point peer
-    // trust switches from height to cumulative difficulty.
+    // Used by the work-aware `synced` flag AND — as of #126 — by block-download
+    // peer eligibility via `work_heavier_peers`: a peer on a shorter-but-heavier
+    // fork is admitted as a block source that height-based selection can never
+    // surface. A full Phase 2b handshake field carrying this value at connection
+    // time remains future work; today the signal is learned from ChainWork
+    // advertisements and observed blocks.
     //
     // Why difficulty, not height? Bitcoin Core, zebrad (Zcash), and
     // bitcoin-rs all select the canonical chain by cumulative work, not
@@ -573,6 +575,24 @@ impl ChainSync {
             .iter()
             .max_by_key(|(_, d)| *d)
             .map(|(p, d)| (*p, *d))
+    }
+
+    /// Peer IDs that currently advertise STRICTLY greater cumulative work than
+    /// our own tip. `peer_difficulties` is maintained to hold exactly these:
+    /// claims at-or-below local work are rejected on insert
+    /// (`update_peer_difficulty_for`), pruned on every local tip advance
+    /// (`set_local_total_difficulty`), and aged out when stale
+    /// (`expire_stale_work_claims`) — plus a bogus-over-claim cap on insert. So
+    /// the keyset is exactly the set of vetted work-heavier sync targets.
+    ///
+    /// This is the block-download counterpart to the work-aware `synced` flag
+    /// (#126): a peer on a shorter-but-HEAVIER fork holds the fork blocks we
+    /// need to reorg, yet a pure height gate in `send_block_spans` filters it
+    /// out, leaving the queued fork hashes undownloaded forever. Admitting these
+    /// peers closes that below-tip heavier-fork wedge without weakening height
+    /// selection (taller peers stay eligible unconditionally).
+    pub fn work_heavier_peers(&self) -> HashSet<PeerId> {
+        self.peer_difficulties.keys().copied().collect()
     }
 
     pub fn best_known_difficulty(&self) -> u128 {
