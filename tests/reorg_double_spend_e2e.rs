@@ -1466,3 +1466,107 @@ fn db_reopen_reconstructs_identical_state() {
 
     println!("PASS db_reopen_reconstructs_identical_state (h1..6)");
 }
+
+// =============================================================================
+// #126 repro: a node on a short PRIVATE fork must reorg onto a HEAVIER branch
+// that forks BELOW its tip. Coinbase-only (no txs) — purely PoW fork-choice /
+// reorg, the "Blocks drained at height N, never reorgs" wedge. Feeds the
+// heavier branch DIRECTLY to add_block: if this PASSES, the chain-layer reorg
+// is sound and #126 is a sync/delivery-layer bug; if it WEDGES (or a fork block
+// below the tip is rejected outright), the chain fork-choice itself is at fault.
+// =============================================================================
+#[test]
+#[ignore = "real-PoW mining, slow; run with --features testnet -- --ignored"]
+fn private_fork_reorgs_onto_heavier_branch_forking_below_tip() {
+    std::env::set_var("COINCYNC_RANDOMX_LIGHT_MODE", "1");
+    coincync::consensus::bind_randomx_genesis_for_network(NetworkType::Testnet);
+
+    let chain = Blockchain::new();
+    chain.init_genesis().expect("genesis init");
+    let genesis = chain.get_block_by_height(0).expect("genesis");
+    let magic = NetworkType::Testnet.magic_bytes();
+    chain
+        .restore_state(0, genesis.hash(), 1)
+        .expect("seed cumulative-work base = 1");
+
+    let (_sk, spend_public) = generate_keypair();
+    let (_vsk, view_public) = generate_keypair();
+    let base_ts = genesis.header.timestamp;
+    let spacing = 3600u64; // ease difficulty to the floor → cheap real PoW
+
+    // ── Common chain B1..B10 (coinbase-only fillers), applied ────────────
+    let mut common: Vec<Block> = vec![genesis.clone()];
+    let mut parent = genesis.clone();
+    for h in 1..=10u64 {
+        let target = chain.next_target();
+        let (cb, _) = build_coinbase(h, &spend_public, &view_public, 0);
+        let b = mine_block(&parent, h, base_ts + h * spacing, target, vec![cb], spend_public, magic);
+        assert!(
+            matches!(chain.add_block(b.clone()).expect("add B"), BlockStatus::Accepted),
+            "B{h} must extend the common chain"
+        );
+        parent = b.clone();
+        common.push(b);
+    }
+    let fork_base = parent.clone(); // B10, height 10 — the common ancestor
+    assert_eq!(chain.height(), 10);
+
+    // ── Node's PRIVATE branch priv11 -> priv12 (self-mined, applied) ─────
+    // Simulates mining while isolated at 0 peers.
+    let t_priv11 = chain.next_target();
+    let (pcb11, _) = build_coinbase(11, &spend_public, &view_public, 0);
+    let priv11 = mine_block(&fork_base, 11, base_ts + 11 * spacing, t_priv11, vec![pcb11], spend_public, magic);
+    assert!(matches!(chain.add_block(priv11.clone()).expect("add priv11"), BlockStatus::Accepted));
+    let t_priv12 = chain.next_target();
+    let (pcb12, _) = build_coinbase(12, &spend_public, &view_public, 0);
+    let priv12 = mine_block(&priv11, 12, base_ts + 12 * spacing, t_priv12, vec![pcb12], spend_public, magic);
+    assert!(matches!(chain.add_block(priv12.clone()).expect("add priv12"), BlockStatus::Accepted));
+    assert_eq!(chain.tip_hash(), priv12.hash(), "node tip is its private branch");
+    assert_eq!(chain.height(), 12);
+
+    // ── Network's HEAVIER branch off B10: net11 -> net12 -> net13 ────────
+    // Forks BELOW the private tip (height 10); 3 blocks > the private 2, so it
+    // carries more cumulative work. Fork targets come from each block's own
+    // difficulty window (as the e2e does for F13), NOT chain.next_target()
+    // (which now reflects the private tip).
+    let win10: Vec<DifficultyBlock> = (0..=10u64).map(|h| diff_block(&common[h as usize])).collect();
+
+    let t_net11 = calculate_difficulty(&win10, 11);
+    let (ncb11, _) = build_coinbase(11, &spend_public, &view_public, 0);
+    let net11 = mine_block(&fork_base, 11, base_ts + 11 * spacing + 1, t_net11, vec![ncb11], spend_public, magic);
+
+    let mut win11 = win10.clone();
+    win11.push(diff_block(&net11));
+    let t_net12 = calculate_difficulty(&win11, 12);
+    let (ncb12, _) = build_coinbase(12, &spend_public, &view_public, 0);
+    let net12 = mine_block(&net11, 12, base_ts + 12 * spacing + 1, t_net12, vec![ncb12], spend_public, magic);
+
+    let mut win12 = win11.clone();
+    win12.push(diff_block(&net12));
+    let t_net13 = calculate_difficulty(&win12, 13);
+    let (ncb13, _) = build_coinbase(13, &spend_public, &view_public, 0);
+    let net13 = mine_block(&net12, 13, base_ts + 13 * spacing + 1, t_net13, vec![ncb13], spend_public, magic);
+
+    // ── Feed the heavier branch to add_block IN ORDER ───────────────────
+    let s11 = chain.add_block(net11.clone()).expect("add net11");
+    assert!(
+        matches!(s11, BlockStatus::AcceptedFork),
+        "#126: net11 forks below the tip and must be stored as a side branch, got {s11:?} \
+         (if rejected, add_block refuses sub-tip fork blocks — that alone wedges recovery)"
+    );
+    let s12 = chain.add_block(net12.clone()).expect("add net12");
+    assert!(matches!(s12, BlockStatus::AcceptedFork), "net12 extends the side branch, got {s12:?}");
+    let s13 = chain.add_block(net13.clone()).expect("add net13");
+
+    // ── The node MUST reorg onto the heavier network branch ─────────────
+    assert_eq!(
+        chain.tip_hash(),
+        net13.hash(),
+        "#126: node must reorg onto the heavier branch that forks below its tip; \
+         tip is {} at height {}, add_block(net13) = {:?}",
+        chain.tip_hash().to_hex(),
+        chain.height(),
+        s13,
+    );
+    assert_eq!(chain.height(), 13, "height must advance to the heavier branch tip");
+}

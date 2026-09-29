@@ -125,14 +125,22 @@ struct Cli {
     /// SOLO MINE: run a built-in CPU miner in this same process, paying the
     /// coinbase to this CYNC address. One command = a node that mines to you,
     /// no separate `coincync-rig` needed. The node only ever sees the address's
-    /// PUBLIC keys (no secret-key custody). Mines only when the node is synced
-    /// (or has no peers, or on regtest), to avoid building a private fork.
+    /// PUBLIC keys (no secret-key custody). Mines only when the node is synced,
+    /// or on regtest, to avoid building a private fork. Mining with 0 peers is
+    /// gated behind `--allow-solo-mine` (see below).
     #[arg(long)]
     mine: Option<String>,
 
     /// Threads for the built-in solo miner (`--mine`). 0 = auto (CPU count).
     #[arg(long, default_value = "0")]
     mine_threads: usize,
+
+    /// Allow the built-in miner to mine with 0 peers on testnet/mainnet — for a
+    /// designated BOOTSTRAP SEED only. OFF by default: a home node that loses
+    /// peers (e.g. router outage) must NOT keep mining, or it builds a private
+    /// fork it can't currently reorg off (issue #126). Regtest always mines.
+    #[arg(long)]
+    allow_solo_mine: bool,
 
     #[command(subcommand)]
     command: Option<Command>,
@@ -544,6 +552,7 @@ async fn main() {
                 cli.stratum_address,
                 cli.mine,
                 cli.mine_threads,
+                cli.allow_solo_mine,
             )
             .await
             {
@@ -777,6 +786,7 @@ async fn start_node(
     stratum_address: Option<String>,
     mine: Option<String>,
     mine_threads: usize,
+    allow_solo_mine: bool,
 ) -> coincync::Result<()> {
     info!("CoinCync 1.0 node starting");
     info!("Network:  {:?}", network);
@@ -1637,11 +1647,15 @@ async fn start_node(
                     let nt = chain_m.network();
                     let mut nonce_base: u64 = 0;
                     loop {
-                        // Mine-gate: never build a private fork. Mine only when
-                        // synced, when there are no peers (solo island), or regtest.
+                        // Mine-gate: never build a private fork. Mine on regtest
+                        // (always), when synced, or with 0 peers ONLY if the
+                        // operator opted in via --allow-solo-mine (a bootstrap
+                        // seed). A home node that loses peers must NOT keep mining
+                        // at 0 peers by default — that builds a private fork it
+                        // can't currently reorg off (issue #126).
                         let allowed = matches!(nt, coincync::config::NetworkType::Regtest)
                             || chain_m.is_synced()
-                            || p2p_m.peer_count() == 0;
+                            || (p2p_m.peer_count() == 0 && allow_solo_mine);
                         if !allowed {
                             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                             continue;
