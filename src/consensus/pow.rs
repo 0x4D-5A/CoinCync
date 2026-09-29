@@ -178,6 +178,23 @@ static SEQ_PAD_CACHE: std::sync::LazyLock<Mutex<SeqPadCache>> =
 #[cfg(feature = "randomx")]
 static RANDOMX_GENESIS_BYTES: OnceLock<[u8; 32]> = OnceLock::new();
 
+/// Whether the built-in solo miner is running in THIS process. Set once at node
+/// startup (from `--mine`). Governs the default RandomX mode (#132): a node that
+/// only VALIDATES verifies one hash per block, so light mode (cache-only) is
+/// strictly better — fast startup, ~256 MB, and no 2 GB dataset rebuild on every
+/// epoch key-switch during sync (the reporter's IBD thrash). Full-mem is
+/// reserved for the miner, where hashrate matters. CONSENSUS-SAFE: hashes are
+/// byte-identical across modes (see `fast_light_equivalence`).
+static NODE_MINING_ACTIVE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Declare whether the built-in miner is active in this process. Call once at
+/// startup, before any block validation/PoW, so the RandomX mode default is
+/// chosen correctly. See [`NODE_MINING_ACTIVE`].
+pub fn set_node_mining_active(active: bool) {
+    NODE_MINING_ACTIVE.store(active, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Bind RandomX epoch keys to the genesis hash for the selected network.
 /// Call once at process startup from `coincync-node` and `coincync-miner` (before PoW).
 pub fn bind_randomx_genesis_for_network(network: crate::config::NetworkType) {
@@ -788,9 +805,19 @@ mod randomx_cache {
             .map(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "yes" | "on"))
             .unwrap_or(false);
 
+        // #132: default to light mode unless the built-in miner is active. A
+        // validating/syncing node checks one hash per block, so the 2 GB
+        // full-mem dataset buys nothing and — worse — is rebuilt on every epoch
+        // key-switch during IBD (~30s each), which is what stalled the reporter's
+        // sync. Full-mem is kept only when this process mines. The env var still
+        // forces light either way (low-RAM opt-out). Consensus-safe: hashes are
+        // identical across modes (fast_light_equivalence).
+        let use_light = light_mode_forced
+            || !super::NODE_MINING_ACTIVE.load(std::sync::atomic::Ordering::Relaxed);
+
         // Tier 1: full-memory mode. JIT + AES + the 2 GB dataset.
-        // Skipped if the operator opted out.
-        if !light_mode_forced {
+        // Used only when this process is mining and full-mem wasn't opted out.
+        if !use_light {
             let full_flags = recommended | RandomXFlag::FLAG_FULL_MEM | secure;
             tracing::info!(
                 "Building RandomX dataset (mode: full-mem): active={:?}, key={}... \
@@ -818,10 +845,12 @@ mod randomx_cache {
                 }
             }
         } else {
-            tracing::info!(
-                "Skipping full-mem RandomX (COINCYNC_RANDOMX_LIGHT_MODE=1 set); \
-                 using light mode directly"
-            );
+            let reason = if light_mode_forced {
+                "COINCYNC_RANDOMX_LIGHT_MODE set"
+            } else {
+                "node is validating-only (not mining) — light mode is sufficient and avoids dataset rebuilds during sync (#132)"
+            };
+            tracing::info!("Using light-mode RandomX directly: {}", reason);
         }
 
         // Tier 2: light mode (cache-only).

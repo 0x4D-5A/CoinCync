@@ -792,6 +792,11 @@ async fn start_node(
     info!("Network:  {:?}", network);
     info!("Data dir: {:?}", data_dir);
 
+    // #132: pick the RandomX mode default before any validation/PoW. A
+    // validating-only node uses light mode (fast sync, ~256 MB, no 2 GB dataset
+    // rebuild per epoch key-switch); full-mem is reserved for the built-in miner.
+    coincync::consensus::pow::set_node_mining_active(mine.is_some());
+
     // Ensure data dir exists
     std::fs::create_dir_all(&data_dir).ok();
 
