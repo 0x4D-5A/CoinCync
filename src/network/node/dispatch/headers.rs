@@ -207,7 +207,9 @@ fn validate_header_batch(
             crate::config::NetworkType::Mainnet => {
                 crate::mainnet::verify_checkpoint(header.height, &header.hash())
             }
-            crate::config::NetworkType::Testnet | crate::config::NetworkType::Regtest => {
+            crate::config::NetworkType::Testnet
+            | crate::config::NetworkType::Regtest
+            | crate::config::NetworkType::Beta => {
                 crate::testnet::verify_checkpoint(header.height, &header.hash())
             }
         };
