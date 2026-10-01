@@ -986,6 +986,7 @@ impl P2PNode {
                     max_outbound: self.config.max_outbound,
                     magic: self.config.magic,
                     our_nonce: self.version_nonce,
+                    bootstrap: self.config.bootstrap.clone(),
                 },
                 node_runtime.shutdown_receiver(),
             ),

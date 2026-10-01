@@ -86,7 +86,7 @@ use tracing::{debug, info, trace, warn};
 
 use crate::config::{P2PEncryptionConfig, ProxyConfig};
 
-use super::super::bootstrap::AddressManager;
+use super::super::bootstrap::{AddressManager, BootstrapConfig, Bootstrapper, PeerAddress};
 use super::super::connection_tracker::{ConnectionTracker, OutboundSubnetSlot};
 use super::super::dandelion::DandelionRouter;
 use super::super::noise::NodeIdentity;
@@ -97,7 +97,10 @@ use super::super::sync::ChainSync;
 use super::super::traffic_shaping::TrafficShaper;
 use super::chain_state::ChainStateReader;
 use super::connection::handle_connection;
-use super::constants::{ANCHOR_MAX, CONNECT_TIMEOUT, INBOUND_HANDSHAKE_SLACK, MAX_INBOUND};
+use super::constants::{
+    ANCHOR_MAX, CONNECT_TIMEOUT, INBOUND_HANDSHAKE_SLACK, MAX_INBOUND, MESH_FLOOR_PEERS,
+    REBOOTSTRAP_BACKOFF_MAX, REBOOTSTRAP_BACKOFF_MIN,
+};
 use super::runtime::wait_for_shutdown;
 use super::types::NodeEvent;
 use super::PeerMessage;
@@ -380,6 +383,10 @@ pub(super) struct OutboundContext {
     pub max_outbound: usize,
     pub magic: [u8; 4],
     pub our_nonce: u64,
+    /// DNS seeds / hardcoded seeds used to re-bootstrap the address book when
+    /// the connector finds it exhausted while under-meshed (#147). Same config
+    /// the startup bootstrap uses.
+    pub bootstrap: BootstrapConfig,
 }
 
 /// The connector wakes on its interval and then observes `running`, preserving
@@ -406,6 +413,7 @@ pub(super) fn spawn_outbound_connector(
         max_outbound,
         magic,
         our_nonce,
+        bootstrap: connector_bootstrap,
     } = context;
 
     tokio::spawn(async move {
@@ -425,6 +433,20 @@ pub(super) fn spawn_outbound_connector(
         let last_attempt: LastAttemptMap =
             Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
         const MIN_RECONNECT_DELAY: Duration = Duration::from_secs(30);
+
+        // RE-BOOTSTRAP-ON-ISOLATION (#147): state for re-resolving DNS seeds
+        // when the address book drains to nothing while under-meshed. `None`
+        // last-time means "never re-bootstrapped this run" (first isolation
+        // triggers immediately); the backoff doubles while re-resolution adds
+        // no new addresses and resets on progress.
+        let mut last_rebootstrap: Option<std::time::Instant> = None;
+        let mut rebootstrap_backoff: Duration = REBOOTSTRAP_BACKOFF_MIN;
+        // Re-bootstrap can only help if there is something to re-resolve. A
+        // seedless config (e.g. regtest, or a node deliberately run with no
+        // seeds) would otherwise trip the isolation branch every backoff
+        // interval and log a no-op warning forever.
+        let connector_has_seeds = !connector_bootstrap.dns_seeds.is_empty()
+            || !connector_bootstrap.seed_nodes.is_empty();
 
         // Log proxy status on startup
         if let Some(ref proxy) = connector_proxy {
@@ -484,6 +506,69 @@ pub(super) fn spawn_outbound_connector(
                 let mut addresses = connector_addresses.write().await;
                 addresses.get_next()
             };
+
+            // RE-BOOTSTRAP-ON-ISOLATION (#147): the dialer has nothing to dial
+            // (get_next() == None means the book is exhausted — empty, or every
+            // entry purged after repeated failures). If we are also under-meshed
+            // (fewer than MESH_FLOOR_PEERS outbound peers, so peer-exchange gossip
+            // cannot replenish the book), re-resolve the DNS seeds to refill it.
+            // Rate-limited with exponential backoff so a persistent DNS outage
+            // settles to one retry per REBOOTSTRAP_BACKOFF_MAX instead of hammering
+            // the resolver. Without this a long-running isolated node never
+            // recovers: the startup bootstrap only runs when the book *starts*
+            // empty, and no other path re-queries DNS after it drains.
+            if addr.is_none()
+                && connector_has_seeds
+                && should_rebootstrap(
+                    outbound_count,
+                    MESH_FLOOR_PEERS,
+                    std::time::Instant::now(),
+                    last_rebootstrap,
+                    rebootstrap_backoff,
+                )
+            {
+                last_rebootstrap = Some(std::time::Instant::now());
+                let onion_only = connector_proxy
+                    .as_ref()
+                    .map(|proxy| proxy.onion_only)
+                    .unwrap_or(false);
+                let proxy_active = connector_proxy.is_some();
+                info!(
+                    "Outbound isolation: {} outbound peers and address book exhausted — \
+                     re-bootstrapping from DNS seeds (next retry in \u{2265}{}s if still isolated)",
+                    outbound_count,
+                    rebootstrap_backoff.as_secs()
+                );
+                let bootstrapper = Bootstrapper::new(connector_bootstrap.clone());
+                let fresh = bootstrapper
+                    .get_peers_with_proxy(onion_only, proxy_active, connector_proxy.as_ref())
+                    .await;
+                let added = {
+                    let mut addresses = connector_addresses.write().await;
+                    let before = addresses.len();
+                    for a in &fresh {
+                        addresses.add(PeerAddress::new(*a));
+                    }
+                    addresses.len().saturating_sub(before)
+                };
+                rebootstrap_backoff = next_rebootstrap_backoff(rebootstrap_backoff, added > 0);
+                if added > 0 {
+                    info!(
+                        "Re-bootstrap added {} fresh address(es) ({} resolved); backoff reset to {}s",
+                        added,
+                        fresh.len(),
+                        rebootstrap_backoff.as_secs()
+                    );
+                } else {
+                    warn!(
+                        "Re-bootstrap resolved {} address(es) but added 0 new; backing off to {}s",
+                        fresh.len(),
+                        rebootstrap_backoff.as_secs()
+                    );
+                }
+                // Dialing resumes next tick with the refilled book.
+                continue;
+            }
 
             if let Some(addr) = addr {
                 // Skip non-onion addresses if onion_only mode is enabled
@@ -610,6 +695,43 @@ pub(super) fn spawn_outbound_connector(
             log_connection_task_result("outbound", result);
         }
     })
+}
+
+/// Decide whether the outbound connector should re-bootstrap from DNS this
+/// tick, given it already found nothing to dial (`get_next() == None`). Pure
+/// and synchronous so the isolation gating and backoff timing are unit-tested
+/// without driving the async connector loop.
+///
+/// Re-bootstrap only when under-meshed — `outbound_count < floor` — because
+/// with a healthy outbound set, addr-relay gossip replenishes the book without
+/// re-querying DNS. `last_rebootstrap == None` means "not yet this run", so the
+/// first isolation re-resolves immediately; afterwards the `backoff` must have
+/// elapsed.
+fn should_rebootstrap(
+    outbound_count: usize,
+    floor: usize,
+    now: std::time::Instant,
+    last_rebootstrap: Option<std::time::Instant>,
+    backoff: Duration,
+) -> bool {
+    if outbound_count >= floor {
+        return false;
+    }
+    match last_rebootstrap {
+        None => true,
+        Some(prev) => now.duration_since(prev) >= backoff,
+    }
+}
+
+/// Advance the re-bootstrap backoff: reset to the floor when the last
+/// re-resolution added new addresses (progress), otherwise double it up to the
+/// ceiling. Pure for testability.
+fn next_rebootstrap_backoff(current: Duration, made_progress: bool) -> Duration {
+    if made_progress {
+        REBOOTSTRAP_BACKOFF_MIN
+    } else {
+        (current * 2).min(REBOOTSTRAP_BACKOFF_MAX)
+    }
 }
 
 async fn observe_outbound_health(
@@ -1080,5 +1202,92 @@ mod tests {
             event_rx.try_recv(),
             Ok(NodeEvent::PeerDisconnected(id)) if id == peer_id
         ));
+    }
+
+    // --- Re-bootstrap-on-isolation gating (#147) --------------------------
+
+    #[test]
+    fn rebootstrap_gated_off_when_mesh_is_healthy() {
+        // At or above the floor, peer-exchange replenishes the book; never
+        // re-query DNS even with an exhausted book and no prior re-bootstrap.
+        let now = std::time::Instant::now();
+        assert!(!should_rebootstrap(
+            MESH_FLOOR_PEERS,
+            MESH_FLOOR_PEERS,
+            now,
+            None,
+            REBOOTSTRAP_BACKOFF_MIN
+        ));
+        assert!(!should_rebootstrap(
+            MESH_FLOOR_PEERS + 5,
+            MESH_FLOOR_PEERS,
+            now,
+            None,
+            REBOOTSTRAP_BACKOFF_MIN
+        ));
+    }
+
+    #[test]
+    fn rebootstrap_fires_immediately_on_first_isolation() {
+        // Under-meshed, book exhausted, never re-bootstrapped this run.
+        let now = std::time::Instant::now();
+        assert!(should_rebootstrap(
+            0,
+            MESH_FLOOR_PEERS,
+            now,
+            None,
+            REBOOTSTRAP_BACKOFF_MIN
+        ));
+        assert!(should_rebootstrap(
+            MESH_FLOOR_PEERS - 1,
+            MESH_FLOOR_PEERS,
+            now,
+            None,
+            REBOOTSTRAP_BACKOFF_MIN
+        ));
+    }
+
+    #[test]
+    fn rebootstrap_respects_backoff_window() {
+        let now = std::time::Instant::now();
+        let last = now.checked_sub(Duration::from_secs(30)).unwrap();
+        // 30s since the last attempt, backoff is 60s → not yet due.
+        assert!(!should_rebootstrap(
+            0,
+            MESH_FLOOR_PEERS,
+            now,
+            Some(last),
+            REBOOTSTRAP_BACKOFF_MIN
+        ));
+        // Once the full backoff has elapsed it is due again.
+        let last = now.checked_sub(REBOOTSTRAP_BACKOFF_MIN).unwrap();
+        assert!(should_rebootstrap(
+            0,
+            MESH_FLOOR_PEERS,
+            now,
+            Some(last),
+            REBOOTSTRAP_BACKOFF_MIN
+        ));
+    }
+
+    #[test]
+    fn rebootstrap_backoff_doubles_until_cap_and_resets_on_progress() {
+        // No progress → exponential doubling.
+        let b1 = next_rebootstrap_backoff(REBOOTSTRAP_BACKOFF_MIN, false);
+        assert_eq!(b1, REBOOTSTRAP_BACKOFF_MIN * 2);
+        let b2 = next_rebootstrap_backoff(b1, false);
+        assert_eq!(b2, REBOOTSTRAP_BACKOFF_MIN * 4);
+        // Doubling saturates at the ceiling, never exceeds it.
+        let mut b = REBOOTSTRAP_BACKOFF_MAX;
+        for _ in 0..4 {
+            b = next_rebootstrap_backoff(b, false);
+            assert!(b <= REBOOTSTRAP_BACKOFF_MAX);
+        }
+        assert_eq!(b, REBOOTSTRAP_BACKOFF_MAX);
+        // Progress resets to the floor.
+        assert_eq!(
+            next_rebootstrap_backoff(REBOOTSTRAP_BACKOFF_MAX, true),
+            REBOOTSTRAP_BACKOFF_MIN
+        );
     }
 }

@@ -33,6 +33,20 @@ pub const MESH_FLOOR_PEERS: usize = 3;
 /// or above the floor.
 pub const MESH_FLOOR_SUSTAIN_TICKS: u32 = 3;
 
+/// Re-bootstrap-on-isolation (#147): minimum interval before the outbound
+/// connector re-resolves the DNS seeds after finding its address book
+/// exhausted while under-meshed. The startup bootstrap only runs when the book
+/// starts empty; once a long-running node's book drains to zero (every known
+/// peer purged after repeated failures) while isolated, nothing else re-queries
+/// DNS. This is the first retry delay; it doubles up to
+/// `REBOOTSTRAP_BACKOFF_MAX` while re-resolution keeps yielding no new
+/// addresses, and resets to this floor as soon as a re-bootstrap adds any.
+pub const REBOOTSTRAP_BACKOFF_MIN: Duration = Duration::from_secs(60);
+/// Ceiling for the exponential re-bootstrap backoff, so a persistent DNS
+/// outage settles at one retry every 30 minutes rather than hammering the
+/// resolver.
+pub const REBOOTSTRAP_BACKOFF_MAX: Duration = Duration::from_secs(30 * 60);
+
 /// Maximum anchor peers persisted across restarts (Bitcoin Core persists 2).
 /// Bounding + longevity-ranking the set keeps anchors to the most stable
 /// long-lived outbound peers rather than every momentarily-connected one.
