@@ -16,7 +16,10 @@
 #   RANDOMX_LIGHT       (optional) set to 1 for low-memory RandomX (~256 MB vs ~2 GB).
 set -euo pipefail
 
-: "${SPARK_OPENSSL_DIR:?set SPARK_OPENSSL_DIR to your static OpenSSL prefix (dir with include/ and lib/)}"
+# OpenSSL prefix for the libspark link. libssl-dev installs under /usr, which
+# works as the prefix, so default there; override for a dedicated static build.
+SPARK_OPENSSL_DIR="${SPARK_OPENSSL_DIR:-/usr}"
+export SPARK_OPENSSL_DIR
 BETA_PAYOUT="${BETA_PAYOUT:-}"
 BETA_MINE_THREADS="${BETA_MINE_THREADS:-2}"
 RANDOMX_LIGHT="${RANDOMX_LIGHT:-0}"
@@ -24,8 +27,20 @@ RANDOMX_LIGHT="${RANDOMX_LIGHT:-0}"
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo_root"
 
+echo "==> Installing build prerequisites (clang/libclang + OpenSSL dev) …"
+if command -v apt-get >/dev/null 2>&1; then
+  apt-get update -qq
+  apt-get install -y build-essential clang libclang-dev pkg-config libssl-dev
+elif command -v dnf >/dev/null 2>&1; then
+  dnf install -y gcc gcc-c++ clang clang-devel openssl-devel pkgconfig
+else
+  echo "    (unknown package manager — ensure a C++ toolchain, clang/libclang, and OpenSSL dev headers are present)"
+fi
+export LIBCLANG_PATH="${LIBCLANG_PATH:-$(llvm-config --libdir 2>/dev/null || echo /usr/lib)}"
+
 echo "==> Building beta node (features: testnet,sketch-gk-proof,libspark-ffi) …"
-export SPARK_OPENSSL_DIR
+echo "    NOTE: this is a full libspark (C++) build — CPU/memory-heavy. On a box"
+echo "    that also runs the live testnet node, expect a load spike during the build."
 cargo build --release --features "testnet,sketch-gk-proof,libspark-ffi" --bin coincync-node
 
 echo "==> Installing binary → /usr/local/bin/coincync-node-beta"

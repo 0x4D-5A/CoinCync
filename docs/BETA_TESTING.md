@@ -61,6 +61,30 @@ export SPARK_OPENSSL_DIR="C:/path/to/openssl-static-md"
 cargo build --release --features "testnet,sketch-gk-proof,libspark-ffi"
 ```
 
+### Linux build (Debian/Ubuntu)
+
+```bash
+# 1. Toolchain: Rust, a C++ compiler, clang/libclang (for the FFI bindings),
+#    and OpenSSL development files.
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh   # if cargo isn't installed
+sudo apt-get update
+sudo apt-get install -y build-essential clang libclang-dev pkg-config libssl-dev
+
+# 2. Point the build at libclang and an OpenSSL prefix (include/ + lib/).
+#    libssl-dev installs OpenSSL under /usr, which works as the prefix:
+export LIBCLANG_PATH="$(llvm-config --libdir 2>/dev/null || echo /usr/lib/llvm-*/lib)"
+export SPARK_OPENSSL_DIR=/usr          # /usr/include/openssl + /usr/lib/.../libcrypto
+
+# 3. Build.
+cargo build --release --features "testnet,sketch-gk-proof,libspark-ffi"
+```
+
+If the linker can't find `libcrypto` under `/usr` on your distro (some put it in
+`/usr/lib/x86_64-linux-gnu`), install a static OpenSSL into a dedicated prefix and
+point `SPARK_OPENSSL_DIR` there instead — the layout the build expects is
+`<prefix>/include/openssl/*.h` and `<prefix>/lib/libcrypto.*`. On RHEL/Fedora the
+package names are `clang clang-devel openssl-devel`.
+
 ## 3. Mine the beta so shielded activates
 
 The beta's low initial difficulty means a single miner reaches height 5 (shielded
