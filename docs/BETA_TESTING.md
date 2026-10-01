@@ -1,0 +1,91 @@
+# CoinCync Beta — trying the shielded (Lelantus-Spark) feature
+
+The **beta** is a disposable, isolated test network for opt-in users to try the
+shielded transaction feature **before** its external audit. It is **not** testnet
+and **not** mainnet:
+
+- Its own network magic (`BETA_MAGIC`) and its own genesis — a separate chain.
+- **Shielded activates at beta block height 5**, with a deliberately **low
+  initial difficulty** so blocks mine in seconds and activation is reached almost
+  immediately.
+- **Testnet and mainnet are unaffected** — on both, shielded stays permanently
+  disabled (`u64::MAX`) until the audit clears. Nothing here changes that.
+
+> ⚠️ **Disposable + unaudited.** The beta chain may be wiped and relaunched at any
+> time, and the shielded crypto is **not yet audited**. Beta coins have **no
+> value**. Do not reuse beta wallets/keys anywhere else.
+
+## 1. Run a beta node (no shielded — default build)
+
+A normal build runs a beta node, but the shielded engine is **fail-closed**
+(`StubBackend`): the node follows the beta chain, but any shielded transaction is
+rejected. Fine if you just want to run a node / mine.
+
+```bash
+cargo build --release --features testnet       # 'testnet' pulls in RandomX; beta reuses it
+./target/release/coincync-node --network beta
+```
+
+(Use `./coincync-node --network beta --help` for the P2P/RPC ports and flags.
+To reach the beta network, `--addnode <BETA_SEED_HOST:PORT>` — the beta seed
+address is announced with each beta launch — or run your own local beta nodes.)
+
+## 2. Build WITH shielded enabled (to actually try shielded)
+
+Shielded only works when the binary is compiled with the shielded engine. Use the
+**validated feature set** (the same combination the 24h in-block soak and the
+shielded test suite run under):
+
+```bash
+cargo build --release --features "testnet,sketch-gk-proof,libspark-ffi"
+```
+
+`libspark-ffi` builds the vendored Firo **libspark** engine, which pulls a **C++
+toolchain + OpenSSL**, so this build has extra prerequisites:
+
+- **LLVM/libclang** — set `LIBCLANG_PATH` to your LLVM `bin` (e.g. on Windows
+  `C:/Program Files/LLVM/bin`).
+- **A static OpenSSL prefix** — set `SPARK_OPENSSL_DIR` to an OpenSSL install with
+  `include/` and `lib/` (the project uses a vcpkg `x64-windows-static-md` build).
+- A C++17 compiler (MSVC on Windows; clang/gcc elsewhere).
+
+See `docs/design/cip-shielded-libspark-ffi.md` for the full build/toolchain
+rationale. Without `libspark-ffi`, `backend()` stays the fail-closed stub and
+shielded transactions are rejected even though the beta network has activated
+them — so the feature flags are **required**, not optional, to exercise shielded.
+
+```bash
+# example (Windows / Git Bash)
+export LIBCLANG_PATH="C:/Program Files/LLVM/bin"
+export SPARK_OPENSSL_DIR="C:/path/to/openssl-static-md"
+cargo build --release --features "testnet,sketch-gk-proof,libspark-ffi"
+```
+
+## 3. Mine the beta so shielded activates
+
+The beta's low initial difficulty means a single miner reaches height 5 (shielded
+activation) in seconds:
+
+```bash
+# generate a payout wallet, then mine solo against your local beta node
+./coincync-rig run-solo --node http://127.0.0.1:<beta-rpc-port> \
+  --address <your-beta-address> --threads 0
+```
+
+Note the rig's **≥3-peer** mining gate still applies on a real mesh; for a tiny
+beta you may run a couple of nodes, or use the node's own `--mine` for a
+single-box beta.
+
+## 4. Try a shielded transaction
+
+With a shielded-enabled build (§2) on a beta node past height 5, the shielded
+wallet subcommands work (`shielded-address`, `shielded-send`, `shielded-balance`;
+see `docs/COMMANDS.md`). Report anything you hit in Discord `#beta`.
+
+## What to report
+
+Anything that looks wrong: a shielded tx that should verify but is rejected (or
+vice-versa), a node that halts, a reorg that strands pool state, or a mismatch
+between what a sender sent and what a recipient scans. Include your beta node logs
+and, if a shielded op failed, the command you ran. These reports feed directly
+into the pre-audit hardening.
