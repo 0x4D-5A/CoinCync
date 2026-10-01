@@ -1,0 +1,51 @@
+[Unit]
+Description=CoinCync BETA-channel seed node (disposable pre-audit shielded test network)
+Documentation=https://github.com/ghostrider1092/CoinCync/blob/beta-channel/docs/BETA_TESTING.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=coincync-beta
+Group=coincync-beta
+# BETA_PAYOUT, BETA_MINE_THREADS, COINCYNC_RANDOMX_LIGHT_MODE live here.
+# The binary is statically linked against OpenSSL (built with SPARK_OPENSSL_DIR),
+# so no OpenSSL env is needed at runtime.
+EnvironmentFile=/etc/coincync/beta.env
+# Beta is its own disposable chain (BETA_MAGIC, beta genesis). Co-locates with the
+# testnet node on the same box via a distinct data-dir and ports (P2P 29080 public
+# so testers can --addnode it; RPC 29081 on loopback only). $BETA_PAYOUT (if set)
+# makes this seed also mine — beta's low difficulty keeps the chain advancing past
+# the shielded activation height (5) so testers always have a live chain.
+ExecStart=/usr/local/bin/coincync-node-beta \
+    --network beta \
+    --data-dir /var/lib/coincync-beta \
+    --p2p-bind 0.0.0.0:29080 \
+    --rpc-bind 127.0.0.1:29081 \
+    $BETA_MINE_ARGS
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+StandardOutput=journal
+StandardError=journal
+
+# Filesystem isolation: only the beta data-dir is writable.
+ReadWritePaths=/var/lib/coincync-beta
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=true
+
+# Network: P2P must accept inbound from anywhere (it's a public seed); RPC is
+# loopback-only (bound to 127.0.0.1 above). Do NOT add IPAddressDeny=any here —
+# that would block the public P2P the seed exists to serve.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+# Resource caps. RandomX full-mode mining needs ~2 GB; if the box is tight, set
+# COINCYNC_RANDOMX_LIGHT_MODE=1 in beta.env and lower this.
+MemoryMax=3G
+TasksMax=256
+LimitNOFILE=16384
+
+[Install]
+WantedBy=multi-user.target
