@@ -38,6 +38,20 @@ else
 fi
 export LIBCLANG_PATH="${LIBCLANG_PATH:-$(llvm-config --libdir 2>/dev/null || echo /usr/lib)}"
 
+# NOTE: the libspark-ffi build (crates/spark-connector/build.rs) is currently
+# Windows/MSVC-only (unconditional WIN32 defines + Windows system libs + MSVC
+# OpenSSL naming), so the cargo build below FAILS on Linux until build.rs is
+# ported to be cross-platform. Until then, build a shielded-capable node on
+# Windows and ship the binary to the box instead of building here. This guard
+# stops the script before a long, doomed build unless you override it.
+if [ "$(uname -s)" = "Linux" ] && [ "${ALLOW_LINUX_LIBSPARK_BUILD:-0}" != "1" ]; then
+  echo "ERROR: shielded (libspark-ffi) build is not yet supported on Linux" >&2
+  echo "       (crates/spark-connector/build.rs is Windows-only — port pending)." >&2
+  echo "       Build the binary on Windows and scp it to /usr/local/bin/coincync-node-beta," >&2
+  echo "       or set ALLOW_LINUX_LIBSPARK_BUILD=1 to attempt it anyway." >&2
+  exit 2
+fi
+
 echo "==> Building beta node (features: testnet,sketch-gk-proof,libspark-ffi) …"
 echo "    NOTE: this is a full libspark (C++) build — CPU/memory-heavy. On a box"
 echo "    that also runs the live testnet node, expect a load spike during the build."

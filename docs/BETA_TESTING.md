@@ -63,6 +63,18 @@ cargo build --release --features "testnet,sketch-gk-proof,libspark-ffi"
 
 ### Linux build (Debian/Ubuntu)
 
+> **⚠️ Shielded on Linux is not buildable yet.** The `libspark-ffi` build
+> (`crates/spark-connector/build.rs`) is currently **Windows/MSVC-only** — it
+> unconditionally sets `WIN32`/`NOMINMAX` and links Windows system libs
+> (`advapi32`, `crypt32`, …) with MSVC OpenSSL naming, so `cargo build
+> --features "...,libspark-ffi"` **fails on Linux** until `build.rs` is ported to
+> be cross-platform (tracked separately). A plain `cargo build --release
+> --features testnet` *does* build on Linux and runs a beta node, but with the
+> fail-closed stub it can't validate shielded txs — so it is **not** a usable beta
+> seed once shielded activates. For now, a shielded-capable node (incl. the seed)
+> must be **built on Windows**. The steps below are the Linux prerequisites for
+> once the port lands.
+
 ```bash
 # 1. Toolchain: Rust, a C++ compiler, clang/libclang (for the FFI bindings),
 #    and OpenSSL development files.
