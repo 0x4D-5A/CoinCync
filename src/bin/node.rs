@@ -18,10 +18,31 @@ use coincync::network::node::NodeConfig as P2PNodeConfig;
 use coincync::network::P2PNode;
 use coincync::rpc::{start_rpc_server, RpcConfig};
 
+/// Extended `--version` output: crate version plus this binary's consensus-rules
+/// fingerprint for each network (see `coincync::consensus::fingerprint`). Lets an
+/// operator compare BINARIES for consensus-rule divergence without starting a
+/// node — e.g. confirm every fleet host was built from the same rules. Computed
+/// once; the fingerprints are deterministic per network.
+fn long_version_string() -> &'static str {
+    use coincync::config::NetworkType;
+    use coincync::consensus::fingerprint::consensus_fingerprint_bytes;
+    use std::sync::OnceLock;
+    static S: OnceLock<String> = OnceLock::new();
+    S.get_or_init(|| {
+        format!(
+            "{}\nconsensus-fingerprint testnet: {}\nconsensus-fingerprint mainnet: {}",
+            env!("CARGO_PKG_VERSION"),
+            hex::encode(consensus_fingerprint_bytes(NetworkType::Testnet)),
+            hex::encode(consensus_fingerprint_bytes(NetworkType::Mainnet)),
+        )
+    })
+    .as_str()
+}
+
 #[derive(Parser)]
 #[command(name = "coincync-node")]
 #[command(about = "CoinCync 1.0 full node daemon")]
-#[command(version)]
+#[command(version, long_version = long_version_string())]
 struct Cli {
     /// Data directory.
     #[arg(long, default_value = "~/.coincync")]
@@ -797,6 +818,12 @@ async fn start_node(
     // rebuild per epoch key-switch); full-mem is reserved for the built-in miner.
     coincync::consensus::pow::set_node_mining_active(mine.is_some());
 
+    // Self-preflight: refuse to run a binary compiled for one network as
+    // another (a mainnet build started as --network testnet, or vice-versa).
+    // This has no consensus effect — it can only reject a misconfigured start,
+    // before any DB or network work. See src/preflight.rs.
+    coincync::preflight::check_compiled_network(network)?;
+
     // Ensure data dir exists
     std::fs::create_dir_all(&data_dir).ok();
 
@@ -1103,6 +1130,13 @@ async fn start_node(
             error!("Failed to load chain database: {}", e);
             std::process::exit(1);
         }
+    }
+
+    // Boot integrity canary: cross-check tip/height-index/UTXO consistency and
+    // refuse to serve a corrupted store (complements the genesis/schema guards).
+    if let Err(e) = chain.boot_integrity_check() {
+        error!("Chain integrity check failed: {}", e);
+        std::process::exit(1);
     }
 
     let tip = chain.tip();
@@ -1838,6 +1872,14 @@ async fn start_node(
     // on a misbehaving disk; without the escape hatch, the user had
     // no way to abort the shutdown.
     let shutdown_seq = async {
+        // Complete graceful P2P shutdown: stop the runtime tasks, then persist
+        // the address book, ban list, and anchor peers, and disconnect peers
+        // cleanly. Previously the binary exited without ever calling stop(), so
+        // peers were dropped abruptly and the address book / bans were only ever
+        // persisted by their periodic timers (up to their interval of loss on a
+        // clean stop). Still inside the select! below, so a second Ctrl+C can
+        // force-exit if a store flush stalls on a bad disk.
+        p2p.stop().await;
         match mempool.save_to_disk(&data_dir) {
             Ok(0) => {}
             Ok(n) => info!("Mempool: saved {} txs to disk", n),
