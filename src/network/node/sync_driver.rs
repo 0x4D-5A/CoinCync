@@ -67,13 +67,19 @@
 //!   slot and delays legitimate catch-up.
 //!   TESTS: (gap — requires a live DashMap/sender/scorer harness not present
 //!   in the test suite).
-//! - **§7 `run_synced_tick` safety net** — INVARIANT: a `Synced` node whose
-//!   `true_best_height` is more than 2 blocks above local (or local is 0
-//!   with peers present) re-triggers a resync rather than sitting idle.
-//!   THREAT: a node that settles into `Synced` prematurely (e.g. after a
-//!   peer_heights reset) would otherwise never re-check for real work.
-//!   TESTS: (gap — exercises `ChainSync::trigger_resync` transitively but no
-//!   test drives `run_synced_tick` itself).
+//! - **§7 `run_synced_tick` + coarse recovery predicates (work-aware, #126)** —
+//!   INVARIANT: the drained-recovery, `no_progress_ticks ≥ 60` net, and
+//!   `run_synced_tick` all re-trigger discovery via
+//!   `ChainSync::should_retrigger_sync` — when a peer is more than `slack`
+//!   blocks TALLER, OR a vetted peer advertises more cumulative WORK
+//!   (`work_behind_substantiated`) — rather than sitting idle. (Also: local 0
+//!   with peers present still re-triggers.)
+//!   THREAT: a node on a shorter-but-heavier fork settled as "synced on height"
+//!   while a heavier chain went unfetched — the height-only predicates never
+//!   fired for it. The substantiation gate keeps a phantom claim from forcing
+//!   perpetual resync.
+//!   TESTS: `should_retrigger_sync_covers_height_and_work_126` (the predicate;
+//!   the async tick loop itself remains unit-test-gapped).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -111,6 +117,11 @@ struct SyncDriverState {
     tier2_last_height: u64,
     last_progress_time_secs: u64,
     emergency_t3_fires: u32,
+    /// #137 — last observed `ChainSync::blocks_delivered()`. Download progress
+    /// (including fork blocks that do not advance the active tip) is a rise in
+    /// this value between ticks; the stall detector treats that as progress so a
+    /// heavier-fork download is not aborted by the 60-tick Headers bounce.
+    last_blocks_delivered: u64,
 }
 
 impl SyncDriverState {
@@ -125,6 +136,7 @@ impl SyncDriverState {
             tier2_last_height: height,
             last_progress_time_secs: 0,
             emergency_t3_fires: 0,
+            last_blocks_delivered: 0,
         }
     }
 
@@ -226,6 +238,23 @@ pub(super) fn spawn_sync_driver(
             let now = chrono::Utc::now().timestamp() as u64;
             let monotonic_now = driver.elapsed_secs();
 
+            // #137 false-stall fix: sample the monotonic count of blocks
+            // DELIVERED to the chain layer once per tick. A rise means the
+            // download pipeline is doing real work — INCLUDING pulling down a
+            // shorter-but-heavier fork, whose requested blocks are delivered
+            // (and stored side-chain) without advancing the ACTIVE TIP until the
+            // branch completes and reorgs. Every height-keyed progress check
+            // below OR-s this in, so a frozen-tip fork download is not misread as
+            // a stall (which would bounce to Headers / fire emergency Tier-3 and
+            // abandon the half-downloaded fork). Sampled ONCE per tick so no site
+            // consumes the increase before another site can see it.
+            let blocks_flowing = {
+                let delivered = sync_sync.read().await.blocks_delivered();
+                let flowing = delivered > driver.last_blocks_delivered;
+                driver.last_blocks_delivered = delivered;
+                flowing
+            };
+
             // Clean up expired sync bans periodically
             sync_sync.write().await.cleanup_sync_bans(now);
 
@@ -265,7 +294,12 @@ pub(super) fn spawn_sync_driver(
             // doing internal work (just no useful work).
             {
                 let current_height_for_progress = sync_chain.height();
-                if current_height_for_progress > driver.last_progress_height {
+                // #137: a tip advance OR blocks delivered this tick both reset
+                // the progress clock. Without the delivered check, a large
+                // heavier-fork download (tip frozen > EMERGENCY_T3_NO_PROGRESS_SECS
+                // while the branch assembles) would fire emergency Tier-3 deep
+                // recovery mid-download.
+                if current_height_for_progress > driver.last_progress_height || blocks_flowing {
                     driver.last_progress_time_secs = monotonic_now;
                     driver.emergency_t3_fires = 0;
                     // last_progress_height itself is updated by the
@@ -475,16 +509,25 @@ pub(super) fn spawn_sync_driver(
             } else if !sync_sync.read().await.is_synced() {
                 // Progress detected — reset all stall counters.
                 let current_height = sync_chain.height();
-                if current_height > driver.last_progress_height {
+                // #137: a tip advance OR blocks delivered this tick both count as
+                // progress (blocks_flowing sampled once at the top of the loop).
+                // Without the delivered check, a heavier-fork download (tip
+                // frozen until the branch reorgs) would keep escalating the
+                // Tier-2/Tier-3 counters while blocks stream in, eventually
+                // triggering the Tier-3 backoff mid-download.
+                let tip_advanced = current_height > driver.last_progress_height;
+                if tip_advanced || blocks_flowing {
                     driver.stall_count = 0;
-                    driver.last_progress_height = current_height;
+                    if tip_advanced {
+                        driver.last_progress_height = current_height;
+                        driver.tier2_last_height = current_height;
+                    }
                     // Real progress made — reset Tier-3 counters too,
                     // not just Tier-1's stall_count. Otherwise a node
                     // that recovers naturally would still escalate to
                     // Tier-3 on the next minor hiccup.
                     driver.tier2_fires_since_progress = 0;
                     driver.tier3_fires_since_progress = 0;
-                    driver.tier2_last_height = current_height;
                 }
             }
 
@@ -521,9 +564,20 @@ pub(super) fn spawn_sync_driver(
 
                     recover_block_requests(&sync_sync, now).await;
 
-                    // Track progress for stall detection
+                    // Track progress for stall detection.
+                    // #137: progress is a tip advance OR any block delivered to
+                    // the chain layer this tick (blocks_flowing, sampled once at
+                    // the top of the loop). Downloading a shorter-but-heavier
+                    // fork delivers (and stores side-chain) blocks without moving
+                    // the ACTIVE TIP until the branch completes and the reorg
+                    // fires — a height-only check reads that as a stall and, at
+                    // 60 ticks, bounces to Headers, abandoning the half-
+                    // downloaded fork. A rising delivered count proves the
+                    // pipeline is doing real work regardless of tip movement.
                     if our_h > driver.last_progress_height {
                         driver.last_progress_height = our_h;
+                        driver.no_progress_ticks = 0;
+                    } else if blocks_flowing {
                         driver.no_progress_ticks = 0;
                     } else {
                         driver.no_progress_ticks += 1;
@@ -542,13 +596,18 @@ pub(super) fn spawn_sync_driver(
                         let sg = sync_sync.read().await;
                         let pending = sg.pending_count();
                         let true_best = sg.true_best_height();
+                        // #126: retrigger when behind by HEIGHT or by cumulative
+                        // WORK (a shorter-but-heavier fork). The old height-only
+                        // `our_h < true_best` never fired for the work case, so a
+                        // drained node sitting below a heavier tip stayed wedged.
+                        let retrigger = sg.should_retrigger_sync(our_h, 0);
+                        let work_behind = sg.work_behind_now();
                         drop(sg);
 
-                        if pending == 0 && our_h < true_best {
-                            // Drained with no work but still behind — go back to Headers
+                        if pending == 0 && retrigger {
                             warn!(
-                            "[IBD] Blocks drained at height {} but target is {}. Re-requesting headers.",
-                            our_h, true_best
+                            "[IBD] Blocks drained at height {} (target {}, work_behind={}). Re-requesting headers.",
+                            our_h, true_best, work_behind
                         );
                             let mut sg = sync_sync.write().await;
                             sg.set_state(SyncState::Headers);
@@ -594,11 +653,16 @@ pub(super) fn spawn_sync_driver(
                     // Safety net: if stuck for 60+ ticks (5min) with no progress,
                     // force back to Headers
                     if driver.no_progress_ticks >= 60 {
-                        let true_best = sync_sync.read().await.true_best_height();
-                        if true_best > our_h + 2 {
+                        let sg = sync_sync.read().await;
+                        let true_best = sg.true_best_height();
+                        // #126: force Headers when behind by height OR work.
+                        let retrigger = sg.should_retrigger_sync(our_h, 2);
+                        let work_behind = sg.work_behind_now();
+                        drop(sg);
+                        if retrigger {
                             warn!(
-                            "[IBD] No progress for {} ticks at height {} (target {}). Forcing Headers.",
-                            driver.no_progress_ticks, our_h, true_best
+                            "[IBD] No progress for {} ticks at height {} (target {}, work_behind={}). Forcing Headers.",
+                            driver.no_progress_ticks, our_h, true_best, work_behind
                         );
                             let mut sg = sync_sync.write().await;
                             sg.set_state(SyncState::Headers);
@@ -829,12 +893,20 @@ async fn run_synced_tick(
 ) {
     driver.stall_count = 0;
     let local_height = chain.height();
-    let target_height = sync.read().await.true_best_height();
+    let sg = sync.read().await;
+    let target_height = sg.true_best_height();
+    // #126: a Synced node also re-triggers when it is work-behind (a
+    // shorter-but-heavier fork advertised by a peer), not only when a taller
+    // peer exists — otherwise it settles as "synced on height" while a heavier
+    // chain goes unfetched.
+    let retrigger = sg.should_retrigger_sync(local_height, 2);
+    let work_behind = sg.work_behind_now();
+    drop(sg);
     let has_peers = peers.iter().any(|peer| peer.state == PeerState::Connected);
-    if (local_height == 0 && has_peers) || target_height > local_height + 2 {
+    if (local_height == 0 && has_peers) || retrigger {
         debug!(
-            "Safety net: local={} true_best={} has_peers={}, re-triggering sync",
-            local_height, target_height, has_peers
+            "Safety net: local={} true_best={} work_behind={} has_peers={}, re-triggering sync",
+            local_height, target_height, work_behind, has_peers
         );
         sync.write().await.trigger_resync();
     }
