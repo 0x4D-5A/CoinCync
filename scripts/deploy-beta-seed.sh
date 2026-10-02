@@ -32,9 +32,9 @@ cd "$repo_root"
 echo "==> Installing build prerequisites (clang/libclang + OpenSSL dev) …"
 if command -v apt-get >/dev/null 2>&1; then
   apt-get update -qq
-  apt-get install -y build-essential clang libclang-dev pkg-config libssl-dev
+  apt-get install -y build-essential clang libclang-dev pkg-config libssl-dev cmake
 elif command -v dnf >/dev/null 2>&1; then
-  dnf install -y gcc gcc-c++ clang clang-devel openssl-devel pkgconfig
+  dnf install -y gcc gcc-c++ clang clang-devel openssl-devel pkgconfig cmake
 else
   echo "    (unknown package manager — ensure a C++ toolchain, clang/libclang, and OpenSSL dev headers are present)"
 fi

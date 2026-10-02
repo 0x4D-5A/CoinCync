@@ -18,8 +18,11 @@ and **not** mainnet:
 ## 1. Run a beta node (no shielded — default build)
 
 A normal build runs a beta node, but the shielded engine is **fail-closed**
-(`StubBackend`): the node follows the beta chain, but any shielded transaction is
-rejected. Fine if you just want to run a node / mine.
+(`StubBackend`): the node follows the beta chain only until the first block that
+carries a shielded transaction (activation is at height 5). From there it rejects
+every such block and stops syncing, so a default build is **not** usable as a
+long-running beta node or seed once shielded is in use. Fine for a quick look at the
+network; build §2 for anything else.
 
 ```bash
 cargo build --release --features testnet       # 'testnet' pulls in RandomX; beta reuses it
