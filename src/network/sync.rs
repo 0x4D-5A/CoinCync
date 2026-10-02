@@ -1199,25 +1199,8 @@ impl ChainSync {
             return Ok(out);
         }
 
-        while self.orphan_blocks.len() >= MAX_ORPHAN_BLOCKS {
-            if let Some(k) = self
-                .orphan_blocks
-                .iter()
-                .min_by_key(|(_, e)| e.received_at)
-                .map(|(k, _)| *k)
-            {
-                if let Some(o) = self.orphan_blocks.remove(&k) {
-                    let p = o.block.header.prev_hash;
-                    if let Some(c) = self.orphan_by_parent.get_mut(&p) {
-                        c.retain(|h| h != &k);
-                        if c.is_empty() {
-                            self.orphan_by_parent.remove(&p);
-                        }
-                    }
-                }
-            } else {
-                break;
-            }
+        if !self.make_room_for_orphan(height) {
+            return Ok(vec![]);
         }
         if let Some(pid) = from {
             let c = self.orphans_per_peer.entry(pid).or_insert(0);
@@ -1254,6 +1237,38 @@ impl ChainSync {
     /// child for re-download. Per-child bookkeeping mirrors the drain loop in
     /// `on_block_received_from` (remove from both maps; decrement the origin
     /// peer's `orphans_per_peer` on resolution).
+    /// Make room in the orphan pool for a block at `height`. Returns false when
+    /// the newcomer should not be admitted: the pool is full and nothing in it
+    /// is farther from the tip than the newcomer. The pool exists to hold the
+    /// blocks right behind a gap until the gap closes, so when it overflows the
+    /// block we need last is the one to drop, never the oldest arrival (which is
+    /// the one nearest the tip, and dropping it re-opens the gap).
+    fn make_room_for_orphan(&mut self, height: u64) -> bool {
+        while self.orphan_blocks.len() >= MAX_ORPHAN_BLOCKS {
+            let farthest = self
+                .orphan_blocks
+                .iter()
+                .max_by_key(|(_, e)| e.block.header.height)
+                .map(|(k, e)| (*k, e.block.header.height));
+            match farthest {
+                Some((_, h)) if height >= h => return false,
+                Some((k, _)) => {
+                    if let Some(o) = self.orphan_blocks.remove(&k) {
+                        let p = o.block.header.prev_hash;
+                        if let Some(c) = self.orphan_by_parent.get_mut(&p) {
+                            c.retain(|h| h != &k);
+                            if c.is_empty() {
+                                self.orphan_by_parent.remove(&p);
+                            }
+                        }
+                    }
+                }
+                None => break,
+            }
+        }
+        true
+    }
+
     pub fn take_orphans_of(&mut self, parent_hash: Hash) -> Vec<(Block, Option<PeerId>)> {
         let mut drained = Vec::new();
         if let Some(children) = self.orphan_by_parent.remove(&parent_hash) {
@@ -1344,29 +1359,11 @@ impl ChainSync {
         // received_at, per-peer cap, parent index).
         let now = unix_now();
         if !self.orphan_blocks.contains_key(&orphan_hash) {
-            // Evict oldest if pool is full.
-            while self.orphan_blocks.len() >= MAX_ORPHAN_BLOCKS {
-                if let Some(k) = self
-                    .orphan_blocks
-                    .iter()
-                    .min_by_key(|(_, e)| e.received_at)
-                    .map(|(k, _)| *k)
-                {
-                    if let Some(o) = self.orphan_blocks.remove(&k) {
-                        let p = o.block.header.prev_hash;
-                        if let Some(c) = self.orphan_by_parent.get_mut(&p) {
-                            c.retain(|h| h != &k);
-                            if c.is_empty() {
-                                self.orphan_by_parent.remove(&p);
-                            }
-                        }
-                    }
-                } else {
-                    break;
-                }
-            }
+            let room = self.make_room_for_orphan(block.header.height);
             // Per-peer cap to bound flood damage.
-            let admit = if let Some(pid) = from {
+            let admit = if !room {
+                false
+            } else if let Some(pid) = from {
                 let c = self.orphans_per_peer.entry(pid).or_insert(0);
                 if *c >= MAX_ORPHANS_PER_PEER {
                     false
@@ -1402,6 +1399,15 @@ impl ChainSync {
             return;
         }
         if self.pending_headers.contains(parent_hash) {
+            return;
+        }
+        // The parent is itself an orphan we already hold: its own parent is
+        // what the chain is missing, and that request is already queued (or
+        // about to be, by its own orphan notification). Re-requesting a pooled
+        // block only produces another orphan report for it. On a single-peer
+        // IBD this turned every 100-block response into 100 re-requests and the
+        // tip advanced by one block per round trip.
+        if self.orphan_blocks.contains_key(parent_hash) {
             return;
         }
 
@@ -3844,7 +3850,7 @@ mod tests {
     /// pool never exceeds `MAX_ORPHAN_BLOCKS`, regardless of how many a peer
     /// pushes. (mark_block_orphan does not PoW-gate, so no mining is needed.)
     #[test]
-    fn mark_block_orphan_lru_evicts_at_max_orphan_blocks() {
+    fn mark_block_orphan_evicts_farthest_at_max_orphan_blocks() {
         use crate::consensus::BlockHeader;
         use crate::primitives::PublicKey;
 
@@ -3889,16 +3895,93 @@ mod tests {
             "pool fills exactly to the cap"
         );
 
-        // Pushing more must evict oldest, keeping the pool bounded.
+        // Blocks farther out than everything pooled are refused; the pool
+        // keeps the blocks nearest the tip, which are the ones a closing gap
+        // needs first.
         for i in 0..50u64 {
             sync.mark_block_orphan(make(1_000_000 + i, 1_000_000 + i), None, &local_tip);
         }
         assert_eq!(
             sync.orphan_blocks.len(),
             MAX_ORPHAN_BLOCKS,
-            "orphan pool stays bounded at MAX_ORPHAN_BLOCKS via LRU eviction \
-             no matter how many orphans arrive"
+            "orphan pool stays bounded at MAX_ORPHAN_BLOCKS no matter how many \
+             orphans arrive"
         );
+        assert!(
+            sync.orphan_blocks.contains_key(&make(1, 0).hash()),
+            "the block nearest the tip survives"
+        );
+        assert!(
+            !sync
+                .orphan_blocks
+                .contains_key(&make(1_000_000, 1_000_000).hash()),
+            "a block farther than everything pooled is not admitted"
+        );
+
+        // A nearer block evicts the farthest pooled one instead.
+        let nearer = make(0, 7);
+        sync.mark_block_orphan(nearer.clone(), None, &local_tip);
+        assert!(sync.orphan_blocks.contains_key(&nearer.hash()));
+        assert!(
+            !sync
+                .orphan_blocks
+                .contains_key(&make(MAX_ORPHAN_BLOCKS as u64, MAX_ORPHAN_BLOCKS as u64 - 1).hash()),
+            "the farthest pooled block made room"
+        );
+        assert_eq!(sync.orphan_blocks.len(), MAX_ORPHAN_BLOCKS);
+    }
+
+    #[test]
+    fn orphan_parent_already_pooled_is_not_requeued() {
+        use crate::consensus::BlockHeader;
+        use crate::primitives::PublicKey;
+
+        let make = |height: u64, prev_hash: Hash| -> Block {
+            Block {
+                header: BlockHeader {
+                    network_magic: crate::config::NetworkType::Testnet.magic_bytes(),
+                    version: 1,
+                    height,
+                    timestamp: 1_000 + height,
+                    prev_hash,
+                    tx_root: Hash::zero(),
+                    anchor: Hash::zero(),
+                    algorithm: 0,
+                    nonce: height,
+                    target: Hash::from_bytes([0xFF; 32]),
+                    miner_pubkey: PublicKey::from_bytes([0u8; 32]),
+                    supply_commitment: [0u8; 32],
+                    checkpoint_vote: None,
+                    spark_set_root: [0u8; 32],
+                    mw_kernel_root: [0u8; 32],
+                },
+                transactions: vec![],
+            }
+        };
+
+        let mut sync = ChainSync::new(0, Hash::zero());
+        let missing = Hash::from_bytes([0xAB; 32]);
+        let a = make(5, missing);
+        let b = make(6, a.hash());
+        let c = make(7, b.hash());
+
+        sync.mark_block_orphan(a.clone(), None, &missing);
+        assert_eq!(
+            sync.pending_headers.front(),
+            Some(&missing),
+            "the first orphan front-queues the block the chain is missing"
+        );
+
+        sync.mark_block_orphan(b.clone(), None, &a.hash());
+        sync.mark_block_orphan(c, None, &b.hash());
+        assert_eq!(sync.orphan_blocks.len(), 3);
+        assert_eq!(
+            sync.pending_headers.len(),
+            1,
+            "parents that are pooled orphans themselves are not requested again"
+        );
+        assert!(!sync.pending_headers.contains(&a.hash()));
+        assert!(!sync.pending_headers.contains(&b.hash()));
     }
 
     /// `trigger_resync` fires ONLY from `Synced`/`Idle` (moving to `Headers`);
