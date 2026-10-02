@@ -105,6 +105,21 @@ use super::runtime::wait_for_shutdown;
 use super::types::NodeEvent;
 use super::PeerMessage;
 
+/// Redial pacing while the node has no outbound peer at all. With one
+/// reachable seed on the network, a dropped connection otherwise sat behind
+/// the 30 s minimum and the exponential dial backoff (up to 300 s) for
+/// minutes while the seed was back within seconds.
+const ISOLATED_RECONNECT_DELAY: Duration = Duration::from_secs(5);
+const ISOLATED_MAX_BACKOFF: Duration = Duration::from_secs(10);
+
+fn dial_retry_delay(backoff: Duration, isolated: bool) -> Duration {
+    if isolated {
+        backoff.min(ISOLATED_MAX_BACKOFF)
+    } else {
+        backoff
+    }
+}
+
 type BackoffMap = Arc<
     tokio::sync::Mutex<
         std::collections::HashMap<
@@ -623,9 +638,12 @@ pub(super) fn spawn_outbound_connector(
                     continue;
                 }
 
-                if connection_attempt_deferred(addr, &last_attempt, &backoffs, MIN_RECONNECT_DELAY)
-                    .await
-                {
+                let min_delay = if outbound_count == 0 {
+                    ISOLATED_RECONNECT_DELAY
+                } else {
+                    MIN_RECONNECT_DELAY
+                };
+                if connection_attempt_deferred(addr, &last_attempt, &backoffs, min_delay).await {
                     continue;
                 }
 
@@ -855,7 +873,15 @@ async fn run_outbound_attempt(attempt: OutboundAttempt) {
             }
         }
         Err(error) => {
-            debug!("Connection to {} failed: {}", addr, error);
+            let isolated = !peers.iter().any(|peer| peer.outbound);
+            if isolated {
+                info!(
+                    "Connection to {} failed ({}); no outbound peers, retrying soon",
+                    addr, error
+                );
+            } else {
+                debug!("Connection to {} failed: {}", addr, error);
+            }
             addresses.write().await.mark_tried(addr);
             let mut backoffs = backoffs.lock().await;
             let (next_attempt, backoff) = backoffs.entry(addr).or_insert_with(|| {
@@ -864,7 +890,7 @@ async fn run_outbound_attempt(attempt: OutboundAttempt) {
                     super::super::framing::ExponentialBackoff::new(),
                 )
             });
-            let delay = backoff.next_delay();
+            let delay = dial_retry_delay(backoff.next_delay(), isolated);
             *next_attempt = std::time::Instant::now() + delay;
             debug!("Backoff for {}: next retry in {:?}", addr, delay);
         }
@@ -1106,6 +1132,22 @@ pub(super) fn disconnect_all(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn isolated_node_caps_the_dial_backoff() {
+        assert_eq!(
+            dial_retry_delay(Duration::from_secs(300), true),
+            ISOLATED_MAX_BACKOFF
+        );
+        assert_eq!(
+            dial_retry_delay(Duration::from_secs(3), true),
+            Duration::from_secs(3)
+        );
+        assert_eq!(
+            dial_retry_delay(Duration::from_secs(300), false),
+            Duration::from_secs(300)
+        );
+    }
 
     #[test]
     fn anchor_round_trip_keeps_only_connected_outbound_peers() {
