@@ -33,6 +33,7 @@ compile_error!(
 
 // ── Foundation ──────────────────────────────────────────────
 pub mod constants;
+pub mod diagnostics;
 pub mod error;
 
 // Kani proof harnesses for top-level helpers in constants.rs.

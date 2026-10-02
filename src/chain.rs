@@ -731,15 +731,15 @@ impl Blockchain {
                     height
                 );
             } else {
+                // Coded diagnostic: a maintainer who sees this gets the stable
+                // code, the invariant, the enforcing location, the spec, and the
+                // fix pointer — plus `coincync-diag explain CYNC-STOR-001`.
                 tracing::error!(
-                    "{}_store.rewind() FAILED at h={} with {} element(s) still \
-                     held — a disconnected block's Phase-2 state cannot be rolled \
-                     back and is now inconsistent with the reorged chain. \
-                     shielded/spark/MW MUST NOT be activated until rewind \
-                     checkpoints are restart-durable (phase-2-reorg-rewind).",
-                    name,
-                    height,
-                    remaining
+                    "\n{}",
+                    crate::diagnostics::Report::new(crate::diagnostics::CYNC_STOR_001)
+                        .at(format!("height {height}, {name} store"))
+                        .expected("0 elements after rewind")
+                        .got(format!("{remaining} element(s) stranded above the new tip"))
                 );
             }
         }
