@@ -72,9 +72,10 @@
 //!   TESTS: `handle_headers_rejected_batch_clears_validation_flag`,
 //!   `handle_headers_valid_batch_queues_and_clears_validation_flag`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use dashmap::DashMap;
+use rayon::prelude::*;
 use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, warn};
 
@@ -132,11 +133,13 @@ struct HeaderBatchError {
 
 fn validate_header_batch(
     chain: &SharedBlockchain,
+    known: &HashSet<Hash>,
     headers: &[BlockHeader],
 ) -> std::result::Result<Vec<Hash>, HeaderBatchError> {
     let expected_magic = chain.network().magic_bytes();
     let mut accepted = HashMap::with_capacity(headers.len());
     let mut hashes = Vec::with_capacity(headers.len());
+    let mut unverified = Vec::with_capacity(headers.len());
 
     for (index, header) in headers.iter().enumerate() {
         let reject = |reason: String, offense| HeaderBatchError {
@@ -267,22 +270,47 @@ fn validate_header_batch(
             }
         }
 
-        verify_pow(
-            &header.prev_hash,
-            header.height,
-            header.timestamp,
-            header.nonce,
-            &header.tx_root,
-            &header.target,
-            &header.anchor,
-            header.algorithm,
-            &header.pow_binding(),
-        )
-        .map_err(|error| reject(error.to_string(), MisbehaviorType::InvalidBlockPoW))?;
-
         let hash = header.hash();
+        // A hash that is already queued for download came through this same
+        // validation, and a hash the chain holds was verified when the block
+        // was applied. Neither needs its RandomX hash again. Every reconnect,
+        // tip refresh and watchdog round re-sends the range we are already
+        // downloading, and hashing 2000 headers costs 25-45 s of one core.
+        if !known.contains(&hash) && chain.get_block_hash(header.height) != Some(hash) {
+            unverified.push(index);
+        }
         accepted.insert(hash, header.clone());
         hashes.push(hash);
+    }
+
+    // RandomX is the expensive part, 10-25 ms per header in light mode. The
+    // headers are independent once the batch is linked, so hash them on all
+    // cores and report the lowest failing index, as the loop above would.
+    let failure = unverified
+        .par_iter()
+        .filter_map(|&index| {
+            let header = &headers[index];
+            verify_pow(
+                &header.prev_hash,
+                header.height,
+                header.timestamp,
+                header.nonce,
+                &header.tx_root,
+                &header.target,
+                &header.anchor,
+                header.algorithm,
+                &header.pow_binding(),
+            )
+            .err()
+            .map(|error| (index, error.to_string()))
+        })
+        .min_by_key(|(index, _)| *index);
+    if let Some((index, reason)) = failure {
+        return Err(HeaderBatchError {
+            index,
+            reason,
+            offense: MisbehaviorType::InvalidBlockPoW,
+        });
     }
 
     Ok(hashes)
@@ -489,7 +517,8 @@ mod tests {
     fn accepts_connected_header_with_valid_pow() {
         let (chain, genesis) = setup();
         let header = first_header(&genesis);
-        let hashes = validate_header_batch(&chain, &[header]).expect("valid header");
+        let hashes =
+            validate_header_batch(&chain, &HashSet::new(), &[header]).expect("valid header");
         assert_eq!(hashes.len(), 1);
     }
 
@@ -523,7 +552,8 @@ mod tests {
         second.timestamp += crate::constants::TARGET_BLOCK_TIME;
         second.target = claimed;
 
-        let error = validate_header_batch(&chain, &[first, second]).expect_err("target mismatch");
+        let error = validate_header_batch(&chain, &HashSet::new(), &[first, second])
+            .expect_err("target mismatch");
         assert_eq!(error.index, 1);
         assert!(
             error.reason.contains("difficulty target mismatch"),
@@ -541,8 +571,8 @@ mod tests {
         second.height = 2;
         second.prev_hash = genesis.hash();
 
-        let error =
-            validate_header_batch(&chain, &[first, second]).expect_err("disconnected batch");
+        let error = validate_header_batch(&chain, &HashSet::new(), &[first, second])
+            .expect_err("disconnected batch");
         assert_eq!(error.index, 1);
         assert!(error.reason.contains("not contiguous"), "{}", error.reason);
         assert_eq!(error.offense, MisbehaviorType::ProtocolViolation);
@@ -554,10 +584,28 @@ mod tests {
         let mut header = first_header(&genesis);
         header.prev_hash = Hash::from_bytes([0xA5; 32]);
 
-        let error = validate_header_batch(&chain, &[header]).expect_err("unknown parent");
+        let error =
+            validate_header_batch(&chain, &HashSet::new(), &[header]).expect_err("unknown parent");
         assert_eq!(error.index, 0);
         assert!(error.reason.contains("known block"), "{}", error.reason);
         assert_eq!(error.offense, MisbehaviorType::ProtocolViolation);
+    }
+
+    #[test]
+    fn queued_header_skips_the_pow_check() {
+        let (chain, genesis) = setup();
+        let mut header = first_header(&genesis);
+        // Nothing meets an all-zero target, so the PoW check must fail...
+        header.target = Hash::zero();
+        let error = validate_header_batch(&chain, &HashSet::new(), std::slice::from_ref(&header))
+            .expect_err("unknown header is hashed");
+        assert_eq!(error.offense, MisbehaviorType::InvalidBlockPoW);
+
+        // ...unless the hash is one we already validated and queued.
+        let known: HashSet<Hash> = [header.hash()].into_iter().collect();
+        let hashes = validate_header_batch(&chain, &known, std::slice::from_ref(&header))
+            .expect("queued header is trusted");
+        assert_eq!(hashes, vec![header.hash()]);
     }
 }
 
@@ -615,10 +663,11 @@ pub(super) async fn handle_headers(
             // stalled the driver for the whole verification (audit map, 9). The
             // validating flag keeps `headers_request_pending()` true so the
             // driver does not issue a second GetHeaders meanwhile.
+            let known = sync_guard.queued_header_hashes();
             sync_guard.begin_headers_validation();
             drop(sync_guard);
 
-            let validated = validate_header_batch(chain, &headers_msg.headers);
+            let validated = validate_header_batch(chain, &known, &headers_msg.headers);
 
             let mut sync_guard = sync.write().await;
             sync_guard.end_headers_validation();

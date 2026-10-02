@@ -993,6 +993,13 @@ impl ChainSync {
         }
     }
 
+    /// Hashes currently queued for download. Each came through
+    /// `handle_headers` validation, so a Headers response that repeats them
+    /// (reconnect, tip refresh, watchdog) can skip their PoW check.
+    pub fn queued_header_hashes(&self) -> HashSet<Hash> {
+        self.pending_header_peer.keys().copied().collect()
+    }
+
     pub fn get_blocks_to_request(&mut self, max: usize) -> Vec<Hash> {
         let mut out = Vec::new();
         let slots = self.max_concurrent.saturating_sub(self.downloading.len());
