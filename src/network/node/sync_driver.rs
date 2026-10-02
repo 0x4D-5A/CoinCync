@@ -55,7 +55,8 @@
 //!   block-hash spans are distributed only to peers that are either strictly
 //!   TALLER than local height OR advertise strictly greater cumulative WORK
 //!   than our tip (`ChainSync::work_heavier_peers`); a peer that is neither is
-//!   never sent a span.
+//!   never sent a span while such a peer exists. With no eligible peer at all
+//!   the span goes to the live peers instead of to nobody.
 //!   THREAT: (P-3, 2026-08-16) a same-height stuck follower received part of
 //!   the span, answered empty, and IBD wedged permanently with no recovery
 //!   tier able to clear it. (#126, 2026-09-28) a peer on a shorter-but-heavier
@@ -63,7 +64,8 @@
 //!   filtered it out, so the queued fork hashes were never requested from
 //!   anyone and the node wedged below the heavier tip.
 //!   TESTS: `send_block_spans_admits_work_heavier_shorter_peer_126`,
-//!   `send_block_spans_rejects_equal_height_equal_work_peer`.
+//!   `send_block_spans_rejects_equal_height_equal_work_peer`,
+//!   `send_block_spans_falls_back_to_the_only_peer`.
 //! - **§6 `live_block_peers` / `remove_dead_senders`** — INVARIANT: only
 //!   peers that are `Connected`, have an open (non-closed) sender channel,
 //!   and are not `GetBlocks`-banned by the scorer are offered as IBD block
@@ -853,10 +855,19 @@ async fn send_block_spans(
         .copied()
         .filter(|(id, h)| *h > local_height || work_heavier.contains(id))
         .collect();
-    if ahead.is_empty() {
+    //
+    // When nobody qualifies, ask the peers we have anyway. The hashes were
+    // queued for a reason (a Headers reply, an orphan's missing parent), and
+    // P-3 was about splitting a span between a taller peer and a same-height
+    // one, not about a lone same-height peer that holds the block: a miner at
+    // the tip gets its only peer's fork announced, the parent goes into the
+    // queue, and with nobody "ahead" nothing ever requested it, so the driver
+    // re-queued it every tick ("Recovered 1 stuck downloads"). A peer that
+    // cannot deliver still times out and is de-scored exactly as before.
+    let peers = if ahead.is_empty() { peers } else { &ahead[..] };
+    if peers.is_empty() {
         return 0;
     }
-    let peers = &ahead[..];
 
     let span_size = hashes.len().div_ceil(peers.len());
     let mut total_sent = 0usize;
@@ -1006,28 +1017,66 @@ mod tests {
     }
 
     // §5 control (P-3 preserved): a peer that is neither taller NOR work-heavier
-    // is still filtered out — the #126 fix widens eligibility, it does not open
-    // the floodgates to same-height, same-work followers.
+    // is still filtered out while a taller peer is there — the #126 fix widens
+    // eligibility, it does not open the floodgates to same-height, same-work
+    // followers.
     #[tokio::test]
     async fn send_block_spans_rejects_equal_height_equal_work_peer() {
         let cs = sync_at(100, 1_000); // no peer work claim recorded
         let peer: PeerId = [9u8; 32];
+        let taller: PeerId = [10u8; 32];
         assert!(!cs.work_heavier_peers().contains(&peer));
         let sync = RwLock::new(cs);
 
         let senders: DashMap<PeerId, mpsc::Sender<Vec<u8>>> = DashMap::new();
         let (tx, mut rx) = mpsc::channel::<Vec<u8>>(4);
         senders.insert(peer, tx);
+        let (taller_tx, mut taller_rx) = mpsc::channel::<Vec<u8>>(4);
+        senders.insert(taller, taller_tx);
 
-        let hashes = vec![Hash::from_bytes([1u8; 32])];
-        let peers = [(peer, 100u64)]; // same height, no work claim
+        let hashes = vec![Hash::from_bytes([1u8; 32]), Hash::from_bytes([2u8; 32])];
+        let peers = [(taller, 110u64), (peer, 100u64)]; // second: same height, no work claim
 
         let sent =
             send_block_spans(&hashes, &peers, &senders, &sync, [0xC0, 0x15, 0x11, 0x00], 1_000, 100)
                 .await;
 
-        assert_eq!(sent, 0, "an equal-height, equal-work peer must not be sent a span");
-        assert!(rx.try_recv().is_err(), "no GetBlocks should be emitted");
+        assert_eq!(sent, 2, "the whole span goes to the taller peer");
+        assert!(taller_rx.try_recv().is_ok(), "the taller peer got the GetBlocks");
+        assert!(rx.try_recv().is_err(), "the equal-height peer must not be sent a span");
+    }
+
+    // With no taller or heavier peer at all, the span still has to go out:
+    // a miner at the tip whose only peer announced a fork block queues the
+    // parent, and nobody "ahead" meant it was re-queued every tick forever.
+    #[tokio::test]
+    async fn send_block_spans_falls_back_to_the_only_peer() {
+        let sync = RwLock::new(sync_at(100, 1_000));
+        let peer: PeerId = [9u8; 32];
+
+        let senders: DashMap<PeerId, mpsc::Sender<Vec<u8>>> = DashMap::new();
+        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(4);
+        senders.insert(peer, tx);
+
+        let hashes = vec![Hash::from_bytes([1u8; 32])];
+        let peers = [(peer, 100u64)];
+
+        let sent = send_block_spans(
+            &hashes,
+            &peers,
+            &senders,
+            &sync,
+            [0xC0, 0x15, 0x11, 0x00],
+            1_000,
+            100,
+        )
+        .await;
+
+        assert_eq!(
+            sent, 1,
+            "the only peer is asked even though it is not ahead"
+        );
+        assert!(rx.try_recv().is_ok(), "a GetBlocks went to that peer");
     }
 
     fn mk_connected_peer(id: PeerId, height: u64) -> PeerInfo {
