@@ -1315,7 +1315,16 @@ async fn start_node(
                             tokio::spawn(async move {
                                 p2p2.notify_block_received(&hash).await;
                                 p2p2.notify_block_processed(chain_update).await;
-                                let _ = p2p2.broadcast_block(&block_for_relay).await;
+                                // Announce only near the tip. While catching up
+                                // every peer that could want this block already
+                                // has it, and at 30+ blocks/s the announcements
+                                // alone exceed a peer's InvBlock rate limit (100
+                                // per 10 s), which the one peer we have scores as
+                                // a flood.
+                                let target = p2p2.sync_target_height().await;
+                                if block_for_relay.header.height + 2 >= target {
+                                    let _ = p2p2.broadcast_block(&block_for_relay).await;
+                                }
                                 // Orphan reconnection: now that this block has
                                 // connected, replay any orphans that were waiting
                                 // on it (re-injected as BlockReceived events so
