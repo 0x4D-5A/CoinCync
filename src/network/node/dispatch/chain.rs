@@ -369,11 +369,23 @@ pub(super) async fn handle_inv_block(
     Ok(())
 }
 
+/// True when both heights hash with the same RandomX key.
+#[cfg(feature = "randomx")]
+fn same_pow_epoch(a: u64, b: u64) -> bool {
+    crate::consensus::randomx_seed_for_height(a) == crate::consensus::randomx_seed_for_height(b)
+}
+
+#[cfg(not(feature = "randomx"))]
+fn same_pow_epoch(_a: u64, _b: u64) -> bool {
+    true
+}
+
 pub(super) async fn handle_blocks(
     peer_id: PeerId,
     payload: &[u8],
     magic: [u8; 4],
     peers: &DashMap<PeerId, PeerInfo>,
+    chain: &SharedBlockchain,
     event_tx: &broadcast::Sender<NodeEvent>,
     scorer: &RwLock<PeerScorer>,
 ) -> Result<()> {
@@ -440,6 +452,14 @@ pub(super) async fn handle_blocks(
                 }
                 return Ok(());
             }
+
+            // Pre-hashing a block from the next RandomX epoch while the chain
+            // task is still applying the current one evicts its key from the
+            // single cache slot, and both sides then rebuild on every hash
+            // until the tip crosses the boundary (issue, cause 7). Blocks past
+            // the tip's epoch skip the pre-hash here; the chain task verifies
+            // their PoW anyway when it applies them.
+            let tip_height = chain.height();
 
             for (bi, block) in blocks_msg.blocks.into_iter().enumerate() {
                 debug!(
@@ -510,6 +530,10 @@ pub(super) async fn handle_blocks(
                 // one solution (e.g. target mutated to spray "new" blocks) share
                 // one RandomX run. Also binds the claimed anchor (recomputed
                 // inside) — the relay previously trusted block.header.anchor.
+                if !same_pow_epoch(block.header.height, tip_height) {
+                    let _ = event_tx.send(NodeEvent::BlockReceived(block, peer_id));
+                    continue;
+                }
                 let pow_hash = match crate::consensus::pow_cache::pow_hash_cached(
                     &block.header.prev_hash,
                     block.header.height,
@@ -771,6 +795,87 @@ mod tests {
     use crate::primitives::PublicKey;
     use std::net::SocketAddr;
 
+    fn empty_chain() -> SharedBlockchain {
+        std::sync::Arc::new(crate::chain::Blockchain::new())
+    }
+
+    fn garbage_pow_block(height: u64) -> Block {
+        Block::new(
+            BlockHeader {
+                network_magic: [1, 2, 3, 4],
+                version: 1,
+                height,
+                timestamp: 1,
+                prev_hash: Hash::zero(),
+                tx_root: Hash::zero(),
+                anchor: Hash::zero(),
+                algorithm: 0,
+                nonce: 0,
+                // Nothing meets an all-zero target.
+                target: Hash::zero(),
+                miner_pubkey: PublicKey::from_bytes([0; 32]),
+                supply_commitment: [0; 32],
+                checkpoint_vote: None,
+                spark_set_root: [0; 32],
+                mw_kernel_root: [0; 32],
+            },
+            Vec::new(),
+        )
+    }
+
+    #[tokio::test]
+    async fn blocks_past_the_tip_epoch_skip_the_prehash() {
+        let peer_id = [9; 32];
+        let addr: SocketAddr = "127.0.0.1:28082".parse().unwrap();
+        let peers = DashMap::new();
+        peers.insert(peer_id, PeerInfo::new(peer_id, addr, false));
+        let (event_tx, mut event_rx) = broadcast::channel(4);
+        let scorer = RwLock::new(PeerScorer::new());
+        let chain = empty_chain();
+
+        // Same epoch as the tip (height 0): the pre-hash runs and rejects it.
+        let payload = borsh::to_vec(&BlocksMessage {
+            blocks: vec![garbage_pow_block(1)],
+        })
+        .unwrap();
+        handle_blocks(
+            peer_id,
+            &payload,
+            [1, 2, 3, 4],
+            &peers,
+            &chain,
+            &event_tx,
+            &scorer,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            event_rx.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+
+        // Two epochs ahead of the tip: handed to the chain task unhashed.
+        let payload = borsh::to_vec(&BlocksMessage {
+            blocks: vec![garbage_pow_block(5000)],
+        })
+        .unwrap();
+        handle_blocks(
+            peer_id,
+            &payload,
+            [1, 2, 3, 4],
+            &peers,
+            &chain,
+            &event_tx,
+            &scorer,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(NodeEvent::BlockReceived(block, _)) if block.header.height == 5000
+        ));
+    }
+
     #[test]
     fn cip019_invblock_near_tip_regime() {
         let window = NEAR_TIP_INV_WINDOW;
@@ -815,9 +920,17 @@ mod tests {
         })
         .unwrap();
 
-        handle_blocks(peer_id, &payload, [1, 2, 3, 4], &peers, &event_tx, &scorer)
-            .await
-            .unwrap();
+        handle_blocks(
+            peer_id,
+            &payload,
+            [1, 2, 3, 4],
+            &peers,
+            &empty_chain(),
+            &event_tx,
+            &scorer,
+        )
+        .await
+        .unwrap();
 
         let guard = scorer.read().await;
         let score = guard.get(&addr).unwrap();
@@ -875,9 +988,17 @@ mod tests {
         })
         .unwrap();
 
-        handle_blocks(peer_id, &payload, magic, &peers, &event_tx, &scorer)
-            .await
-            .unwrap();
+        handle_blocks(
+            peer_id,
+            &payload,
+            magic,
+            &peers,
+            &empty_chain(),
+            &event_tx,
+            &scorer,
+        )
+        .await
+        .unwrap();
 
         let guard = scorer.read().await;
         let score = guard.get(&addr).unwrap();
@@ -905,9 +1026,17 @@ mod tests {
         })
         .unwrap();
 
-        handle_blocks(peer_id, &payload, [1, 2, 3, 4], &peers, &event_tx, &scorer)
-            .await
-            .unwrap();
+        handle_blocks(
+            peer_id,
+            &payload,
+            [1, 2, 3, 4],
+            &peers,
+            &empty_chain(),
+            &event_tx,
+            &scorer,
+        )
+        .await
+        .unwrap();
 
         let guard = scorer.read().await;
         let score = guard.get(&addr).unwrap();
@@ -933,9 +1062,17 @@ mod tests {
         let scorer = RwLock::new(PeerScorer::new());
 
         let payload = borsh::to_vec(&BlocksMessage { blocks: vec![] }).unwrap();
-        handle_blocks(peer_id, &payload, [1, 2, 3, 4], &peers, &event_tx, &scorer)
-            .await
-            .unwrap();
+        handle_blocks(
+            peer_id,
+            &payload,
+            [1, 2, 3, 4],
+            &peers,
+            &empty_chain(),
+            &event_tx,
+            &scorer,
+        )
+        .await
+        .unwrap();
 
         let guard = scorer.read().await;
         let score = guard.get(&addr).expect("score entry created");
