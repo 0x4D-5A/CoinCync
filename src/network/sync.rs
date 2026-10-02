@@ -932,6 +932,12 @@ impl ChainSync {
                 if self.true_best_height() > self.local_height + 2 {
                     self.state = SyncState::Headers;
                     self.headers_request_time = None; // Reset timeout to allow re-request
+                } else if self.state == SyncState::Headers && self.local_height > 0 {
+                    // Nobody claims more than we have and the peer we asked had
+                    // nothing past our tip: one confirming round, then Synced,
+                    // as after a block commit. Staying in Headers meant a new
+                    // GetHeaders every tick, each answered empty again.
+                    self.state = SyncState::ConfirmingSynced;
                 }
             }
             return;
@@ -2041,6 +2047,29 @@ mod tests {
         assert!(sync.is_synced());
         sync.update_peer_height(100);
         assert!(!sync.is_synced());
+    }
+
+    #[test]
+    fn empty_headers_reply_leaves_headers_state_when_nobody_is_ahead() {
+        let peer: PeerId = [7u8; 32];
+        let mut sync = ChainSync::new(100, Hash::zero());
+        sync.set_state(SyncState::Headers);
+        sync.queue_headers_from_peer(peer, vec![]);
+        assert_eq!(
+            sync.state(),
+            SyncState::ConfirmingSynced,
+            "an empty reply with nobody ahead starts the confirming round"
+        );
+        sync.queue_headers_from_peer(peer, vec![]);
+        assert_eq!(sync.state(), SyncState::Synced);
+
+        // A peer that still claims more keeps us asking.
+        let other: PeerId = [8u8; 32];
+        sync.update_peer_height_for(other, 110);
+        assert_eq!(sync.state(), SyncState::Headers);
+        sync.queue_headers_from_peer(peer, vec![]);
+        assert_eq!(sync.state(), SyncState::Headers);
+        assert!(!sync.headers_request_pending());
     }
 
     #[test]
