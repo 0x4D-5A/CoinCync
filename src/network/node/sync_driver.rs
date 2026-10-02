@@ -92,7 +92,7 @@ use std::time::Duration;
 use dashmap::DashMap;
 use tokio::sync::{mpsc, watch, RwLock};
 use tokio::task::JoinHandle;
-use tokio::time::interval;
+use tokio::time::{interval, MissedTickBehavior};
 use tracing::{debug, info, warn};
 
 use crate::chain::SharedBlockchain;
@@ -192,6 +192,12 @@ pub(super) fn spawn_sync_driver(
         // 500ms tick during IBD — aggressive sync for fast convergence.
         // Each tick requests up to 500 blocks distributed across all peers.
         let mut tick = interval(Duration::from_millis(500));
+        // The default (Burst) replays every tick missed while the loop body
+        // was blocked, back-to-back. `no_progress_ticks` counts ticks as
+        // time (60 ticks = 30s at 500ms), so one long stall on the sync lock
+        // could burn the whole budget in a second and force Headers for
+        // nothing. Delay keeps consecutive ticks 500ms apart.
+        tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let _stall_timeout: u64 = 30; // seconds before considering sync stalled
         let mut driver = SyncDriverState::new(sync_chain.height());
 
@@ -655,7 +661,7 @@ pub(super) fn spawn_sync_driver(
                         }
                     }
 
-                    // Safety net: if stuck for 60+ ticks (5min) with no progress,
+                    // Safety net: if stuck for 60+ ticks (30s at 500ms) with no progress,
                     // force back to Headers
                     if driver.no_progress_ticks >= 60 {
                         let sg = sync_sync.read().await;

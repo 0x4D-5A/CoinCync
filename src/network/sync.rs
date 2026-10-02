@@ -78,7 +78,8 @@
 //!   `header_nonce_rejects_cross_peer_without_consuming`,
 //!   `header_nonce_rejected_after_generation_reset`,
 //!   `header_nonce_cancelled_send_allows_immediate_retry`,
-//!   `header_nonce_unsolicited_rejected`.
+//!   `header_nonce_unsolicited_rejected`,
+//!   `headers_validation_keeps_request_pending`.
 
 use crate::consensus::Block;
 use crate::error::Result;
@@ -231,6 +232,13 @@ pub struct ChainSync {
     last_sync_peer: Option<PeerId>,
     headers_request_time: Option<u64>,
     headers_received_this_cycle: bool,
+    /// True while `handle_headers` is verifying a Headers batch whose nonce
+    /// it has already consumed. The batch is verified with the `ChainSync`
+    /// lock released (2000 RandomX header checks take tens of seconds in
+    /// light mode), so this is what keeps `headers_request_pending()` true
+    /// for that window; without it the sync driver would see no request in
+    /// flight and issue a second GetHeaders for the same range.
+    validating_headers: bool,
     peer_heights: HashMap<PeerId, u64>,
     /// Outstanding GetHeaders nonces, bound to the peer the request was sent to
     /// and the sync generation it was issued in. A Headers response is only
@@ -351,6 +359,7 @@ impl ChainSync {
             last_sync_peer: None,
             headers_request_time: None,
             headers_received_this_cycle: false,
+            validating_headers: false,
             peer_heights: HashMap::new(),
             peer_difficulties: HashMap::new(),
             best_known_difficulty: 0,
@@ -1472,7 +1481,7 @@ impl ChainSync {
     /// peer already owns the in-flight cycle, so callers must not send a second
     /// request that could later invalidate the first response.
     pub fn begin_headers_request(&mut self, peer: PeerId, now: u64) -> Option<u64> {
-        if self.headers_request_time.is_some() {
+        if self.headers_request_pending() {
             return None;
         }
         let n = self.next_header_nonce;
@@ -1545,8 +1554,23 @@ impl ChainSync {
     /// not whether a request was *currently pending*, so it sent a fresh
     /// one every tick regardless of in-flight state. See
     /// `docs/crucible/cycle-01/finding-03-headers-request-flood.md`.
+    ///
+    /// Also true while a received batch is being verified off-lock
+    /// (`validating_headers`): the nonce is consumed before verification
+    /// starts, so the request clock alone would read as "nothing pending".
     pub fn headers_request_pending(&self) -> bool {
-        self.headers_request_time.is_some()
+        self.headers_request_time.is_some() || self.validating_headers
+    }
+
+    /// Bracket an off-lock `validate_header_batch` call. See
+    /// `validating_headers`. The caller must call `end_headers_validation`
+    /// on every exit path once it re-takes the lock.
+    pub fn begin_headers_validation(&mut self) {
+        self.validating_headers = true;
+    }
+
+    pub fn end_headers_validation(&mut self) {
+        self.validating_headers = false;
     }
 
     pub fn reset_headers_timeout(&mut self) {
@@ -3840,5 +3864,37 @@ mod tests {
             sync.begin_headers_request(peers[0], 1_061).is_none(),
             "headers_request_pending must gate a re-issue"
         );
+    }
+
+    /// A received batch is verified outside the `ChainSync` lock, after its
+    /// nonce has been consumed. For that window `headers_request_pending`
+    /// must stay true (no second GetHeaders), and the 60s request timeout
+    /// must not apply - verification can legitimately take longer than that
+    /// on a slow CPU.
+    #[test]
+    fn headers_validation_keeps_request_pending() {
+        let peers = peer_pool();
+        let mut sync = ChainSync::new(100, Hash::zero());
+        let n = sync.begin_headers_request(peers[0], 1_000).unwrap();
+        assert!(sync.validate_header_nonce(n, &peers[0]));
+        assert!(!sync.headers_request_pending(), "nonce consumed");
+
+        sync.begin_headers_validation();
+        assert!(
+            sync.headers_request_pending(),
+            "validating keeps the cycle pending"
+        );
+        assert!(
+            sync.begin_headers_request(peers[1], 1_001).is_none(),
+            "no competing GetHeaders while a batch is being verified"
+        );
+        assert!(
+            !sync.headers_timed_out(1_000 + 600),
+            "verification is not bounded by the 60s request timeout"
+        );
+
+        sync.end_headers_validation();
+        assert!(!sync.headers_request_pending());
+        assert!(sync.begin_headers_request(peers[1], 1_002).is_some());
     }
 }
