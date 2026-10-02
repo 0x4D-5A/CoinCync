@@ -51,6 +51,12 @@ path = "src/bin/sign_snapshot.rs"
 name = "coincync-tick"
 path = "src/bin/coincync-tick.rs"
 
+[[bin]]
+# Explain CoinCync diagnostic codes (like `rustc --explain`). Read-only; prints
+# from the compile-time diagnostics catalog. See src/bin/diag.rs.
+name = "coincync-diag"
+path = "src/bin/diag.rs"
+
 [features]
 default = ["randomx"]
 testnet = ["randomx"]
