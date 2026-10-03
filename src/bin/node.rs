@@ -4,6 +4,7 @@
 // loads / initializes chain state, starts the P2P listener and the
 // JSON-RPC server, then blocks until ctrl-C.
 
+use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -270,9 +271,18 @@ async fn main() {
             );
             "info".parse().expect("'info' is a valid log filter")
         });
+    // Colours only where a terminal will render them; a classic Windows
+    // console needs VT mode switched on first or it prints the escapes.
+    #[cfg(windows)]
+    let console_ok = nu_ansi_term::enable_ansi_support().is_ok();
+    #[cfg(not(windows))]
+    let console_ok = true;
+    let ansi =
+        std::env::var_os("NO_COLOR").is_none() && std::io::stdout().is_terminal() && console_ok;
     tracing_subscriber::fmt()
         .with_env_filter(env_filter)
         .with_target(false)
+        .with_ansi(ansi)
         .init();
 
     let network = match cli.network.as_str() {
