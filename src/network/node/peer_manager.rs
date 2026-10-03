@@ -30,8 +30,9 @@
 //!   THREAT: without these gates the connector self-connects, thrashes a
 //!   single peer in a connect/disconnect loop, or burns Noise handshake
 //!   slots retrying too fast — starving real address-book progress.
-//!   TESTS: (gap — no unit test for `is_self_dial` or
-//!   `connection_attempt_deferred` in isolation).
+//!   TESTS: `schedule_retry_grows_the_delay_and_caps_it_when_isolated` (the
+//!   backoff step); no unit test yet for `is_self_dial` or
+//!   `connection_attempt_deferred` in isolation.
 //! - **§4 `spawn_outbound_connector` per-/16 eclipse cap
 //!   (`try_track_outbound_subnet_owned`, RAII `outbound_slot`)** —
 //!   INVARIANT: an attacker controlling one /16 cannot hold more than
@@ -106,7 +107,7 @@ use super::runtime::wait_for_shutdown;
 use super::types::NodeEvent;
 use super::PeerMessage;
 
-/// Redial pacing while the node has no outbound peer at all. With one
+/// Redial pacing while the node has no peer at all. With one
 /// reachable seed on the network, a dropped connection otherwise sat behind
 /// the 30 s minimum and the exponential dial backoff (up to 300 s) for
 /// minutes while the seed was back within seconds.
@@ -121,17 +122,52 @@ fn dial_retry_delay(backoff: Duration, isolated: bool) -> Duration {
     }
 }
 
-type BackoffMap = Arc<
-    tokio::sync::Mutex<
-        std::collections::HashMap<
-            SocketAddr,
-            (
-                std::time::Instant,
-                super::super::framing::ExponentialBackoff,
-            ),
-        >,
-    >,
+type BackoffTable = std::collections::HashMap<
+    SocketAddr,
+    (
+        std::time::Instant,
+        super::super::framing::ExponentialBackoff,
+    ),
 >;
+type BackoffMap = Arc<tokio::sync::Mutex<BackoffTable>>;
+
+/// Push the next attempt at `addr` out by its exponential backoff and return
+/// the delay; capped while the node has no peer at all (`dial_retry_delay`).
+fn schedule_retry(backoffs: &mut BackoffTable, addr: SocketAddr, isolated: bool) -> Duration {
+    let (next_attempt, backoff) = backoffs.entry(addr).or_insert_with(|| {
+        (
+            std::time::Instant::now(),
+            super::super::framing::ExponentialBackoff::new(),
+        )
+    });
+    let delay = dial_retry_delay(backoff.next_delay(), isolated);
+    *next_attempt = std::time::Instant::now() + delay;
+    delay
+}
+
+/// A dial that did not become a peer, whether TCP or the handshake failed.
+async fn note_dial_failure(
+    addr: SocketAddr,
+    error: &str,
+    peers: &DashMap<PeerId, PeerInfo>,
+    addresses: &RwLock<AddressManager>,
+    backoffs: &BackoffMap,
+) {
+    let isolated = !peers.iter().any(|peer| peer.state == PeerState::Connected);
+    addresses.write().await.mark_tried(addr);
+    let delay = schedule_retry(&mut *backoffs.lock().await, addr, isolated);
+    if isolated {
+        info!(
+            "Connection to {} failed ({}); no peers, retrying in {:?}",
+            addr, error, delay
+        );
+    } else {
+        debug!(
+            "Connection to {} failed ({}); next retry in {:?}",
+            addr, error, delay
+        );
+    }
+}
 type LastAttemptMap =
     Arc<tokio::sync::Mutex<std::collections::HashMap<SocketAddr, std::time::Instant>>>;
 
@@ -504,6 +540,10 @@ pub(super) fn spawn_outbound_connector(
             let outbound_count =
                 observe_outbound_health(&connector_peers, &connector_addresses, &connector_tracker)
                     .await;
+            // No connected peer at all, inbound included.
+            let isolated = !connector_peers
+                .iter()
+                .any(|peer| peer.state == PeerState::Connected);
 
             // Enforce the global outbound peer ceiling.
             // Eclipse protection (per-/16 diversity) is now handled
@@ -639,7 +679,7 @@ pub(super) fn spawn_outbound_connector(
                     continue;
                 }
 
-                let min_delay = if outbound_count == 0 {
+                let min_delay = if isolated {
                     ISOLATED_RECONNECT_DELAY
                 } else {
                     MIN_RECONNECT_DELAY
@@ -846,7 +886,6 @@ async fn run_outbound_attempt(attempt: OutboundAttempt) {
 
     match super::super::proxy::connect_peer(addr, proxy.as_ref(), CONNECT_TIMEOUT).await {
         Ok(stream) => {
-            backoffs.lock().await.remove(&addr);
             let result = handle_connection(
                 stream,
                 generate_peer_id(),
@@ -855,7 +894,7 @@ async fn run_outbound_attempt(attempt: OutboundAttempt) {
                 our_nonce,
                 height,
                 tip,
-                peers,
+                peers.clone(),
                 senders,
                 event_tx,
                 msg_tx,
@@ -867,33 +906,17 @@ async fn run_outbound_attempt(attempt: OutboundAttempt) {
             )
             .await;
             if let Err(error) = result {
+                // Err here means the session never started (handshake or
+                // version), so this is a failed dial and backs off like one.
                 warn!("Outbound connection error: {}", error);
-                addresses.write().await.mark_tried(addr);
+                note_dial_failure(addr, &error.to_string(), &peers, &addresses, &backoffs).await;
             } else {
+                backoffs.lock().await.remove(&addr);
                 addresses.write().await.mark_success(addr);
             }
         }
         Err(error) => {
-            let isolated = !peers.iter().any(|peer| peer.outbound);
-            if isolated {
-                info!(
-                    "Connection to {} failed ({}); no outbound peers, retrying soon",
-                    addr, error
-                );
-            } else {
-                debug!("Connection to {} failed: {}", addr, error);
-            }
-            addresses.write().await.mark_tried(addr);
-            let mut backoffs = backoffs.lock().await;
-            let (next_attempt, backoff) = backoffs.entry(addr).or_insert_with(|| {
-                (
-                    std::time::Instant::now(),
-                    super::super::framing::ExponentialBackoff::new(),
-                )
-            });
-            let delay = dial_retry_delay(backoff.next_delay(), isolated);
-            *next_attempt = std::time::Instant::now() + delay;
-            debug!("Backoff for {}: next retry in {:?}", addr, delay);
+            note_dial_failure(addr, &error.to_string(), &peers, &addresses, &backoffs).await;
         }
     }
 }
@@ -1150,6 +1173,22 @@ mod tests {
             dial_retry_delay(Duration::from_secs(300), false),
             Duration::from_secs(300)
         );
+    }
+
+    // Each failure pushes the next attempt out; isolated stays under the cap.
+    #[test]
+    fn schedule_retry_grows_the_delay_and_caps_it_when_isolated() {
+        let addr: SocketAddr = "10.0.0.9:28080".parse().unwrap();
+        let mut table = BackoffTable::new();
+        let first = schedule_retry(&mut table, addr, false);
+        let second = schedule_retry(&mut table, addr, false);
+        assert!(second > first, "{:?} then {:?}", first, second);
+        for _ in 0..10 {
+            schedule_retry(&mut table, addr, false);
+        }
+        assert!(schedule_retry(&mut table, addr, false) > Duration::from_secs(200));
+        assert!(schedule_retry(&mut table, addr, true) <= ISOLATED_MAX_BACKOFF);
+        assert!(table[&addr].0 > std::time::Instant::now());
     }
 
     #[test]
