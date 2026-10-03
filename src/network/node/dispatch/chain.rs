@@ -371,12 +371,12 @@ pub(super) async fn handle_inv_block(
 
 /// True when both heights hash with the same RandomX key.
 #[cfg(feature = "randomx")]
-fn same_pow_epoch(a: u64, b: u64) -> bool {
+pub(super) fn same_pow_epoch(a: u64, b: u64) -> bool {
     crate::consensus::randomx_seed_for_height(a) == crate::consensus::randomx_seed_for_height(b)
 }
 
 #[cfg(not(feature = "randomx"))]
-fn same_pow_epoch(_a: u64, _b: u64) -> bool {
+pub(super) fn same_pow_epoch(_a: u64, _b: u64) -> bool {
     true
 }
 

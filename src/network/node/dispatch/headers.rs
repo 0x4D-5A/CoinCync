@@ -89,6 +89,7 @@ use crate::network::sync::ChainSync;
 use crate::primitives::Hash;
 
 use super::super::broadcast::send_to_peer;
+use super::chain::same_pow_epoch;
 
 fn header_history(
     chain: &SharedBlockchain,
@@ -286,34 +287,54 @@ fn validate_header_batch(
     // RandomX is the expensive part, 10-25 ms per header in light mode. The
     // headers are independent once the batch is linked, so hash them on all
     // cores and report the lowest failing index, as the loop above would.
-    let failure = unverified
-        .par_iter()
-        .filter_map(|&index| {
-            let header = &headers[index];
-            verify_pow(
-                &header.prev_hash,
-                header.height,
-                header.timestamp,
-                header.nonce,
-                &header.tx_root,
-                &header.target,
-                &header.anchor,
-                header.algorithm,
-                &header.pow_binding(),
-            )
-            .err()
-            .map(|error| (index, error.to_string()))
-        })
-        .min_by_key(|(index, _)| *index);
-    if let Some((index, reason)) = failure {
-        return Err(HeaderBatchError {
-            index,
-            reason,
-            offense: MisbehaviorType::InvalidBlockPoW,
-        });
+    // One epoch at a time, though: the dataset cache holds a single key and
+    // rebuilds on a mismatch (0.3 s in light mode, 23 s with the full
+    // dataset), so a batch that straddles a 2048-block boundary with both
+    // keys live on different threads rebuilt it on nearly every hash.
+    for group in epoch_groups(headers, &unverified) {
+        let failure = group
+            .par_iter()
+            .filter_map(|&index| {
+                let header = &headers[index];
+                verify_pow(
+                    &header.prev_hash,
+                    header.height,
+                    header.timestamp,
+                    header.nonce,
+                    &header.tx_root,
+                    &header.target,
+                    &header.anchor,
+                    header.algorithm,
+                    &header.pow_binding(),
+                )
+                .err()
+                .map(|error| (index, error.to_string()))
+            })
+            .min_by_key(|(index, _)| *index);
+        if let Some((index, reason)) = failure {
+            return Err(HeaderBatchError {
+                index,
+                reason,
+                offense: MisbehaviorType::InvalidBlockPoW,
+            });
+        }
     }
 
     Ok(hashes)
+}
+
+/// Splits `indices` (ascending positions in `headers`) into runs whose
+/// headers hash with the same RandomX key, in order.
+fn epoch_groups(headers: &[BlockHeader], indices: &[usize]) -> Vec<Vec<usize>> {
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    for &index in indices {
+        let height = headers[index].height;
+        match groups.last_mut() {
+            Some(group) if same_pow_epoch(headers[group[0]].height, height) => group.push(index),
+            _ => groups.push(vec![index]),
+        }
+    }
+    groups
 }
 
 /// #158: resolve the GetHeaders response start height from a block locator.
@@ -606,6 +627,28 @@ mod tests {
         let hashes = validate_header_batch(&chain, &known, std::slice::from_ref(&header))
             .expect("queued header is trusted");
         assert_eq!(hashes, vec![header.hash()]);
+    }
+
+    #[test]
+    fn header_pow_runs_one_epoch_at_a_time() {
+        let (_chain, genesis) = setup();
+        // The first height whose RandomX key differs from its parent's.
+        let Some(boundary) = (1..10_000u64).find(|&h| !same_pow_epoch(h - 1, h)) else {
+            return; // no epochs in this build
+        };
+        let headers: Vec<BlockHeader> = (boundary - 2..boundary + 2)
+            .map(|height| {
+                let mut header = first_header(&genesis);
+                header.height = height;
+                header
+            })
+            .collect();
+        assert_eq!(
+            epoch_groups(&headers, &[0, 1, 2, 3]),
+            vec![vec![0, 1], vec![2, 3]],
+            "headers on each side of the boundary are hashed as separate groups"
+        );
+        assert!(epoch_groups(&headers, &[]).is_empty());
     }
 }
 
