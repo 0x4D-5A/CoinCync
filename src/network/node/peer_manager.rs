@@ -69,8 +69,9 @@
 //!   THREAT: a scoring bug that zeroes out weights entirely would make
 //!   relay/target selection silently starve, biasing propagation or making
 //!   Dandelion routing predictable.
-//!   TESTS: (gap — no test drives `pick_scored_peer`'s weighted-random
-//!   selection or its zero-weight/lock-contention fallback path).
+//!   TESTS: `pick_scored_peer_only_considers_allowed_peers` (gap — nothing
+//!   drives the weighted-random selection itself or its zero-weight /
+//!   lock-contention fallback path).
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -957,14 +958,16 @@ fn log_connection_task_result(direction: &'static str, result: Result<(), tokio:
     }
 }
 
-/// Pick a connected peer using composite-score weighted randomness.
+/// Pick a connected peer that `allow` accepts, using composite-score weighted
+/// randomness.
 pub(super) fn pick_scored_peer(
     peers: &Arc<DashMap<PeerId, PeerInfo>>,
     scorer: &Arc<RwLock<PeerScorer>>,
+    allow: &dyn Fn(&PeerInfo) -> bool,
 ) -> Option<PeerId> {
     let connected: Vec<(PeerId, SocketAddr)> = peers
         .iter()
-        .filter(|peer| peer.state == PeerState::Connected)
+        .filter(|peer| peer.state == PeerState::Connected && allow(peer.value()))
         .map(|peer| (peer.id, peer.addr))
         .collect();
     if connected.is_empty() {
@@ -1147,6 +1150,28 @@ mod tests {
             dial_retry_delay(Duration::from_secs(300), false),
             Duration::from_secs(300)
         );
+    }
+
+    #[test]
+    fn pick_scored_peer_only_considers_allowed_peers() {
+        let peers = Arc::new(DashMap::new());
+        let scorer = Arc::new(RwLock::new(PeerScorer::new()));
+        for (id, height) in [([1u8; 32], 50u64), ([2u8; 32], 150)] {
+            let addr: SocketAddr = format!("10.0.0.{}:28080", id[0]).parse().unwrap();
+            let mut info = PeerInfo::new(id, addr, true);
+            info.state = PeerState::Connected;
+            info.height = height;
+            peers.insert(id, info);
+        }
+        let taller = |peer: &PeerInfo| peer.height >= 100;
+        for _ in 0..20 {
+            assert_eq!(pick_scored_peer(&peers, &scorer, &taller), Some([2u8; 32]));
+        }
+        assert_eq!(
+            pick_scored_peer(&peers, &scorer, &|_: &PeerInfo| false),
+            None
+        );
+        assert!(pick_scored_peer(&peers, &scorer, &|_: &PeerInfo| true).is_some());
     }
 
     #[test]

@@ -731,7 +731,15 @@ async fn run_headers_tick(
     if locator.is_empty() {
         return;
     }
-    let Some(peer_id) = pick_scored_peer(peers, scorer) else {
+    // Ask a peer that is not behind us. One that is answers the locator from
+    // the first entry it knows and sends back headers we already have, so the
+    // round is wasted. Any peer will do when nobody is ahead: a node at the
+    // tip still needs its empty reply to settle into Synced.
+    let work_heavier = sync.read().await.work_heavier_peers();
+    let not_behind = |peer: &PeerInfo| peer.height >= height || work_heavier.contains(&peer.id);
+    let Some(peer_id) = pick_scored_peer(peers, scorer, &not_behind)
+        .or_else(|| pick_scored_peer(peers, scorer, &|_: &PeerInfo| true))
+    else {
         return;
     };
     if sync.read().await.is_sync_banned(&peer_id, now) {
