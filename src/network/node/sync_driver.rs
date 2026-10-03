@@ -16,7 +16,8 @@
 //!   the sync engine looked internally busy so `is_stalled` never fired;
 //!   without the repeat-throttle, an unthrottled version would log-flood at
 //!   tick rate.
-//!   TESTS: `emergency_recovery_respects_progress_and_thresholds`.
+//!   TESTS: `emergency_recovery_respects_progress_and_thresholds`,
+//!   `emergency_recovery_counts_from_falling_behind`.
 //! - **§2 `run_headers_tick` pending-request gate** — INVARIANT: the tick
 //!   loop checks `headers_request_pending()` and returns early rather than
 //!   issuing a second concurrent GetHeaders.
@@ -158,8 +159,15 @@ impl SyncDriverState {
         self.started_at.elapsed().as_secs()
     }
 
-    fn emergency_recovery_due(&self, monotonic_now: u64, is_synced: bool) -> bool {
-        if is_synced || monotonic_now < EMERGENCY_T3_NO_PROGRESS_SECS {
+    fn emergency_recovery_due(&mut self, monotonic_now: u64, is_synced: bool) -> bool {
+        if is_synced {
+            // Synced: nothing to catch up with, so keep the clock current or
+            // the first tick behind a new taller peer fires straight away.
+            self.last_progress_time_secs = monotonic_now;
+            self.emergency_t3_fires = 0;
+            return false;
+        }
+        if monotonic_now < EMERGENCY_T3_NO_PROGRESS_SECS {
             return false;
         }
         let since_progress = monotonic_now.saturating_sub(self.last_progress_time_secs);
@@ -641,6 +649,10 @@ pub(super) fn spawn_sync_driver(
                             let mut sg = sync_sync.write().await;
                             sg.set_state(SyncState::Headers);
                             sg.reset_headers_timeout();
+                        } else if pending == 0 {
+                            // Idle at the tip: not a stall, so these ticks must
+                            // not feed the 60-tick net below.
+                            driver.no_progress_ticks = 0;
                         }
                     } else {
                         // Step 3: MULTI-PEER SPAN DOWNLOAD
@@ -969,11 +981,26 @@ mod tests {
 
         assert!(!state.emergency_recovery_due(299, false));
         assert!(state.emergency_recovery_due(300, false));
-        assert!(!state.emergency_recovery_due(300, true));
 
         state.emergency_t3_fires = 1;
         assert!(!state.emergency_recovery_due(419, false));
         assert!(state.emergency_recovery_due(420, false));
+
+        assert!(!state.emergency_recovery_due(420, true));
+    }
+
+    // The count starts when the node falls behind, not at its last block.
+    #[test]
+    fn emergency_recovery_counts_from_falling_behind() {
+        let mut state = SyncDriverState::new(10);
+        state.last_progress_time_secs = 0;
+        state.emergency_t3_fires = 1;
+
+        assert!(!state.emergency_recovery_due(1000, true));
+        assert_eq!(state.emergency_t3_fires, 0);
+        assert!(!state.emergency_recovery_due(1001, false));
+        assert!(!state.emergency_recovery_due(1299, false));
+        assert!(state.emergency_recovery_due(1300, false));
     }
 
     fn sync_at(height: u64, local_work: u128) -> ChainSync {
