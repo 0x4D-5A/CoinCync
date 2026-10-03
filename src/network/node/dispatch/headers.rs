@@ -35,10 +35,12 @@
 //!   TESTS: `rejects_self_declared_easy_target_after_difficulty_activates`.
 //! - **§5 `validate_header_batch` (proof-of-work)** — INVARIANT: `verify_pow`
 //!   must succeed against the header's bound anchor/nonce/tx_root/target
-//!   before a header is accepted into `hashes`.
+//!   before a header is accepted into `hashes`. Headers the chain already
+//!   holds skip the check and are left out of the result.
 //!   THREAT: a structurally-valid header with forged or missing PoW being
 //!   queued for sync.
-//!   TESTS: `accepts_connected_header_with_valid_pow`.
+//!   TESTS: `accepts_connected_header_with_valid_pow`,
+//!   `headers_already_in_the_chain_are_not_returned`.
 //! - **§6 `handle_get_headers`** — INVARIANT: oversized `GetHeaders` payloads
 //!   are dropped and scored before parsing; the response is bounded to
 //!   `MAX_HEADERS_RESPONSE` headers starting from the first locator match.
@@ -141,6 +143,7 @@ fn validate_header_batch(
     let mut accepted = HashMap::with_capacity(headers.len());
     let mut hashes = Vec::with_capacity(headers.len());
     let mut unverified = Vec::with_capacity(headers.len());
+    let mut held = Vec::with_capacity(headers.len());
 
     for (index, header) in headers.iter().enumerate() {
         let reject = |reason: String, offense| HeaderBatchError {
@@ -277,9 +280,11 @@ fn validate_header_batch(
         // was applied. Neither needs its RandomX hash again. Every reconnect,
         // tip refresh and watchdog round re-sends the range we are already
         // downloading, and hashing 2000 headers costs 25-45 s of one core.
-        if !known.contains(&hash) && chain.get_block_hash(header.height) != Some(hash) {
+        let in_chain = chain.get_block_hash(header.height) == Some(hash);
+        if !known.contains(&hash) && !in_chain {
             unverified.push(index);
         }
+        held.push(in_chain);
         accepted.insert(hash, header.clone());
         hashes.push(hash);
     }
@@ -320,7 +325,16 @@ fn validate_header_batch(
         }
     }
 
-    Ok(hashes)
+    // Headers for blocks we already have are not handed back. A peer that is
+    // behind us answers our locator from the first entry it knows, genesis
+    // when it is far behind, and returns its whole chain; queueing those
+    // downloads up to 2000 blocks we hold and processes them as duplicates,
+    // on every GetHeaders that happens to land on such a peer.
+    Ok(hashes
+        .into_iter()
+        .zip(held)
+        .filter_map(|(hash, in_chain)| (!in_chain).then_some(hash))
+        .collect())
 }
 
 /// Splits `indices` (ascending positions in `headers`) into runs whose
@@ -627,6 +641,29 @@ mod tests {
         let hashes = validate_header_batch(&chain, &known, std::slice::from_ref(&header))
             .expect("queued header is trusted");
         assert_eq!(hashes, vec![header.hash()]);
+    }
+
+    #[test]
+    fn headers_already_in_the_chain_are_not_returned() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Arc::new(crate::db::Database::open(dir.path()).expect("db"));
+        let chain = Arc::new(Blockchain::with_database(
+            db,
+            crate::config::NetworkType::Testnet,
+        ));
+        chain.init_genesis().expect("genesis");
+        chain.seed_linear_chain_for_testing(1, crate::constants::TARGET_BLOCK_TIME);
+        let block = chain.get_block_by_height(1).expect("seeded block");
+        assert_eq!(chain.get_block_hash(1), Some(block.hash()));
+        // The peer sends a header we already have: nothing to hash, nothing
+        // to queue.
+        let hashes = validate_header_batch(&chain, &HashSet::new(), &[block.header])
+            .expect("a header we hold is valid");
+        assert!(
+            hashes.is_empty(),
+            "held headers must not be queued: {:?}",
+            hashes
+        );
     }
 
     #[test]
