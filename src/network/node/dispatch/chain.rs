@@ -436,7 +436,7 @@ pub(super) async fn handle_blocks(
             // incompatible and continue with other peers.
             if blocks_msg.blocks.is_empty() {
                 debug!(
-                    "[IBD] Got 0 blocks from peer {:?} — empty Blocks reply, demoting",
+                    "[IBD] Got 0 blocks from peer {:?} - empty Blocks reply, demoting",
                     &peer_id[..4]
                 );
                 // Record an empty-Blocks response so the scorer can ban
@@ -562,7 +562,7 @@ pub(super) async fn handle_blocks(
                 };
                 if !pow_hash.meets_difficulty(&block.header.target) {
                     warn!(
-                        "Instant-banning peer {} — provably-invalid PoW: \
+                        "Instant-banning peer {} - provably-invalid PoW: \
                        block hash {:?} does not meet claimed target {:?}",
                         hex::encode(&peer_id[..8]),
                         pow_hash,
@@ -744,7 +744,7 @@ pub(super) async fn handle_block_data(
         };
         if !pow_hash.meets_difficulty(&block.header.target) {
             warn!(
-                "Instant-banning peer {:?} — BlockData block with provably-invalid PoW",
+                "Instant-banning peer {:?} - BlockData block with provably-invalid PoW",
                 &peer_id[..4]
             );
             if let Some(addr) = peers.get(&peer_id).map(|p| p.addr) {

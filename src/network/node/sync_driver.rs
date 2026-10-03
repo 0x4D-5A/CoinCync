@@ -452,7 +452,7 @@ pub(super) fn spawn_sync_driver(
                     if advanced_since_last_tier2 {
                         // We DID advance between Tier-2 firings — recovery
                         // is working, even if slowly. Reset Tier-3 counter.
-                        warn!("Sync stalled, rotating peers (made progress since last rotation: {} → {})",
+                        warn!("Sync stalled, rotating peers (made progress since last rotation: {} -> {})",
                           driver.tier2_last_height, current_height);
                         driver.tier2_fires_since_progress = 0;
                         driver.tier3_fires_since_progress = 0;
@@ -494,7 +494,7 @@ pub(super) fn spawn_sync_driver(
                          height stuck at {} (peers={}). Performing aggressive recovery: clearing the \
                          address book tried-list, dropping ALL orphans (not just expired), resetting \
                          headers-request timeout. If this fires repeatedly without recovery, the node \
-                         may be on a fork the peers don't share — operator may need to wipe + reimport snapshot.",
+                         may be on a fork the peers don't share - operator may need to wipe + reimport snapshot.",
                         driver.tier3_fires_since_progress,
                         driver.tier2_fires_since_progress,
                         current_height,

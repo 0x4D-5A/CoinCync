@@ -152,7 +152,7 @@ pub(super) async fn handle_version(
         if version.nonce == our_nonce {
             warn!(
                 "Self-connection nonce match from peer {:?} \
-                 — disconnecting. NOT marking as self-address \
+                 - disconnecting. NOT marking as self-address \
                  because the nonce is replayable; if this fires \
                  repeatedly for legitimately-yours addresses, \
                  check that --addnode doesn't list this node's \
@@ -372,7 +372,7 @@ pub(super) async fn handle_consensus_fingerprint(
     let local = crate::consensus::fingerprint::consensus_fingerprint_bytes(chain.network());
     if msg.fingerprint != local {
         warn!(
-            "Peer {:?} consensus-fingerprint MISMATCH: peer={} local={} — peer may run divergent \
+            "Peer {:?} consensus-fingerprint MISMATCH: peer={} local={} - peer may run divergent \
              consensus rules (advisory; not disconnecting)",
             &peer_id[..4],
             hex::encode(msg.fingerprint),
@@ -541,7 +541,7 @@ pub(super) async fn handle_verack(
                     };
                 if sent {
                     info!(
-                        "Handshake complete — GetHeaders nonce={} to peer {:?} (h={}, we={})",
+                        "Handshake complete - GetHeaders nonce={} to peer {:?} (h={}, we={})",
                         nonce,
                         &peer_id[..4],
                         peer_height,

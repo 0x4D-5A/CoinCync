@@ -1316,7 +1316,7 @@ impl ChainSync {
         }
         self.pending_headers.push_front(*hash);
         tracing::debug!(
-            "Block {} failed — re-queued for retry",
+            "Block {} failed - re-queued for retry",
             &hash.to_hex()[..16]
         );
     }
@@ -1436,7 +1436,7 @@ impl ChainSync {
             }
         }
         tracing::debug!(
-            "Orphan {} → fetching parent {} (pool: {} blocks)",
+            "Orphan {} -> fetching parent {} (pool: {} blocks)",
             &orphan_hash.to_hex()[..16],
             &parent_hash.to_hex()[..16],
             self.orphan_blocks.len(),

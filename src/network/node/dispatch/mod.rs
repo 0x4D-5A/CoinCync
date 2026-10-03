@@ -120,7 +120,7 @@ pub(super) async fn process_message(
     ) && payload.len() > MAX_LIGHT_QUERY_PAYLOAD
     {
         tracing::warn!(
-            "Oversized {:?} payload ({} bytes) from peer {:?} — dropping",
+            "Oversized {:?} payload ({} bytes) from peer {:?} - dropping",
             msg_type,
             payload.len(),
             &peer_id[..4]

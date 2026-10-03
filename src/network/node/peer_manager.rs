@@ -550,7 +550,7 @@ pub(super) fn spawn_outbound_connector(
                     .unwrap_or(false);
                 let proxy_active = connector_proxy.is_some();
                 info!(
-                    "Outbound isolation: {} outbound peers and address book exhausted — \
+                    "Outbound isolation: {} outbound peers and address book exhausted - \
                      re-bootstrapping from DNS seeds (next retry in \u{2265}{}s if still isolated)",
                     outbound_count,
                     rebootstrap_backoff.as_secs()
@@ -632,7 +632,7 @@ pub(super) fn spawn_outbound_connector(
                 // been tried, so this isn't permanent exclusion.
                 if connector_peers.iter().any(|p| p.addr == addr) {
                     trace!(
-                        "Skipping {} — already have an active peer at this address",
+                        "Skipping {} - already have an active peer at this address",
                         addr
                     );
                     connector_addresses.write().await.mark_tried(addr);
@@ -795,7 +795,7 @@ async fn observe_outbound_health(
             .collect();
         let (old_sum, new_sum) = tracker.reconcile_outbound_subnets(&live_outbound);
         warn!(
-            "eclipse-defense: significant drift — subnet_sum={} but outbound_count={} (diff={}) :: {} :: RECONCILED {}→{} from {} live outbound",
+            "eclipse-defense: significant drift - subnet_sum={} but outbound_count={} (diff={}) :: {} :: RECONCILED {}->{} from {} live outbound",
             subnet_sum,
             outbound_count,
             drift,
@@ -806,7 +806,7 @@ async fn observe_outbound_health(
         );
     } else if drift == 1 {
         debug!(
-            "eclipse-defense: minor drift (cosmetic) — subnet_sum={} but outbound_count={} :: {}",
+            "eclipse-defense: minor drift (cosmetic) - subnet_sum={} but outbound_count={} :: {}",
             subnet_sum,
             outbound_count,
             pretty.join(", ")
@@ -907,7 +907,7 @@ async fn connection_attempt_deferred(
     if let Some(attempted_at) = last_attempt.lock().await.get(&addr) {
         if attempted_at.elapsed() < minimum_delay {
             trace!(
-                "Skipping {} — last attempt was {:?} ago (min {:?})",
+                "Skipping {} - last attempt was {:?} ago (min {:?})",
                 addr,
                 attempted_at.elapsed(),
                 minimum_delay

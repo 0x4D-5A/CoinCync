@@ -332,14 +332,14 @@ async fn main() {
                 }
                 Ok(coincync::db::MigrationOutcome::Stamped { genesis_hash }) => {
                     info!(
-                        "✓ Legacy DB migrated successfully. schema_version stamped. (genesis verified: {})",
+                        "Legacy DB migrated successfully. schema_version stamped. (genesis verified: {})",
                         genesis_hash,
                     );
                     info!("You can now start the node normally: `systemctl start coincync-node` (or just `coincync-node`).");
                 }
                 Err(e) => {
                     error!("Migration failed: {}", e);
-                    error!("The DB has NOT been modified. Read the error above carefully — most migration failures are 'wrong --network flag' or 'wrong --data-dir path'.");
+                    error!("The DB has NOT been modified. Read the error above carefully - most migration failures are 'wrong --network flag' or 'wrong --data-dir path'.");
                     std::process::exit(1);
                 }
             }
@@ -405,7 +405,7 @@ async fn main() {
             let version = env!("CARGO_PKG_VERSION");
 
             info!(
-                "Exporting snapshot: network={} height={} tip={} → {}",
+                "Exporting snapshot: network={} height={} tip={} -> {}",
                 network_subdir,
                 height,
                 tip_hex,
@@ -423,7 +423,7 @@ async fn main() {
             ) {
                 Ok(m) => {
                     info!(
-                        "✓ Snapshot exported to {} (height={}, db_blake3={})",
+                        "Snapshot exported to {} (height={}, db_blake3={})",
                         out.display(),
                         m.height,
                         m.db_blake3
@@ -443,7 +443,7 @@ async fn main() {
                                     seed.copy_from_slice(&bytes);
                                     match coincync::snapshot::sign_snapshot_dir(&out, &seed) {
                                         Ok(sig) => info!(
-                                            "✓ Snapshot manifest signed by {} → {}/manifest.sig",
+                                            "Snapshot manifest signed by {} -> {}/manifest.sig",
                                             sig.signer_pubkey,
                                             out.display()
                                         ),
@@ -460,7 +460,7 @@ async fn main() {
                             }
                         }
                         Err(_) => {
-                            info!("(unsigned — set COINCYNC_SNAPSHOT_SIGN_SEED_HEX to sign the manifest)");
+                            info!("(unsigned - set COINCYNC_SNAPSHOT_SIGN_SEED_HEX to sign the manifest)");
                         }
                     }
 
@@ -539,7 +539,7 @@ async fn main() {
             match coincync::snapshot::import(&input, &chaindata_path, &policy) {
                 Ok(m) => {
                     info!(
-                        "✓ Snapshot imported: height={} tip={} (produced by {} at unix {}).",
+                        "Snapshot imported: height={} tip={} (produced by {} at unix {}).",
                         m.height, m.tip_hash, m.node_version, m.created_at
                     );
                     info!(
@@ -549,7 +549,7 @@ async fn main() {
                 }
                 Err(e) => {
                     error!("Snapshot import failed: {}", e);
-                    error!("Your previous chaindata (if any) was moved to a `.pre-snapshot-*` sibling and NOT deleted — see the error above.");
+                    error!("Your previous chaindata (if any) was moved to a `.pre-snapshot-*` sibling and NOT deleted - see the error above.");
                     std::process::exit(1);
                 }
             }
@@ -876,7 +876,7 @@ async fn start_node(
         if addnode_proxied {
             warn!(
                 "--addnode {:?}: hostname resolution is disabled under --proxy/--tor \
-                 to avoid a DNS leak — pass a numeric IP:port instead",
+                 to avoid a DNS leak - pass a numeric IP:port instead",
                 raw
             );
             continue;
@@ -1074,7 +1074,7 @@ async fn start_node(
         }
         Err(e) => {
             warn!(
-                "Spark store init failed: {} — get_privacy_stats will show \
+                "Spark store init failed: {} - get_privacy_stats will show \
                  zeros for spark_root/spark_accumulator_size",
                 e
             );
@@ -1091,7 +1091,7 @@ async fn start_node(
         }
         Err(e) => {
             warn!(
-                "Shielded store init failed: {} — get_privacy_stats will show \
+                "Shielded store init failed: {} - get_privacy_stats will show \
                  zeros for shielded_root/shielded_tree_size",
                 e
             );
@@ -1104,7 +1104,7 @@ async fn start_node(
         }
         Err(e) => {
             warn!(
-                "Kernel store init failed: {} — get_privacy_stats will show \
+                "Kernel store init failed: {} - get_privacy_stats will show \
                  zeros for mw_kernel_root",
                 e
             );
@@ -1711,7 +1711,7 @@ async fn start_node(
                 let mempool_m = mempool.clone();
                 let p2p_m = p2p.clone();
                 info!(
-                    "Built-in solo miner ON — mining to {}… ({} threads)",
+                    "Built-in solo miner ON - mining to {}... ({} threads)",
                     &mine_addr[..mine_addr.len().min(16)],
                     n_threads
                 );
@@ -1801,7 +1801,7 @@ async fn start_node(
                                 &chain_m, &mempool_m, block,
                             ) {
                                 Ok(status) => {
-                                    info!("miner: block at height {} — {:?}", height, status);
+                                    info!("miner: block at height {} - {:?}", height, status);
                                     let accepted = matches!(
                                         status,
                                         coincync::chain::BlockStatus::Accepted
@@ -1901,7 +1901,7 @@ async fn start_node(
             info!("Shutdown complete.");
         }
         _ = tokio::signal::ctrl_c() => {
-            warn!("Second Ctrl+C received — skipping mempool save, exiting immediately.");
+            warn!("Second Ctrl+C received - skipping mempool save, exiting immediately.");
         }
     }
 
@@ -1955,11 +1955,11 @@ async fn start_node(
             );
         }
         Ok(Err(join_err)) => {
-            error!("RocksDB flush task panicked: {} — exiting anyway", join_err);
+            error!("RocksDB flush task panicked: {} - exiting anyway", join_err);
         }
         Err(_) => {
             warn!(
-                "RocksDB flush did not complete within {}s — force-exiting. \
+                "RocksDB flush did not complete within {}s - force-exiting. \
                  Next startup may need to replay WAL.",
                 flush_deadline.as_secs()
             );
