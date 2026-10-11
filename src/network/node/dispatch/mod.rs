@@ -79,10 +79,9 @@ pub(super) async fn process_message(
     payload: &[u8],
     magic: [u8; 4],
     our_nonce: u64,
-    // `peers` / `sync` / `scorer` are `&Arc<…>` (not `&…`); every handler call below
-    // receives `&…` via deref coercion, unchanged. (They were widened to `&Arc` when
-    // the Headers arm spawned an owned-handle verify task; harmless now that the arm
-    // runs inline, and kept to avoid churning the signature and its call sites.)
+    // `peers` / `sync` / `scorer` are taken as `&Arc<…>` (not `&…`) so the Headers
+    // arm can clone owned handles into a spawned verify task; every other handler
+    // call below still receives `&…` via deref coercion, unchanged.
     peers: &Arc<DashMap<PeerId, PeerInfo>>,
     senders: &DashMap<PeerId, mpsc::Sender<Vec<u8>>>,
     dandelion: &RwLock<DandelionRouter>,
@@ -256,20 +255,29 @@ pub(super) async fn process_message(
         }
 
         MessageType::Headers => {
-            // Runs INLINE on the message processor. The ~24-46s RandomX header-batch
-            // verify therefore serializes with block-apply on this one task, so the
-            // two never flip the shared light-mode RandomX cache slot concurrently
-            // across a key epoch — the no-thrash invariant #285 relies on. (An earlier
-            // revision spawned this handler off the processor to stop it starving
-            // handshakes during cold-start IBD; that re-introduced the epoch-boundary
-            // cache thrash #285 had driven down. Handshakes are now serviced on their
-            // own dedicated lane — see `process_handshake` and
-            // `runtime::spawn_handshake_processor` — so this verify can stay inline and
-            // serialized here without blocking any peer's Version/Verack.) The H-3
-            // pre-handshake gate above has already run; handle_headers runs the RandomX
-            // batch via spawn_blocking so it never pins an async worker thread, and
-            // re-checks the nonce under the write lock.
-            headers::handle_headers(peer_id, payload, peers, sync, chain, scorer).await?;
+            // SPAWN so the header-batch verify runs OFF this single message
+            // processor and block-apply keeps going while the batch is checked:
+            // handle_headers §9 queues each verified slice at once and pauses at a
+            // RandomX key-epoch boundary until the tip is there, so the verify never
+            // flips the light-mode cache against block-apply (that pacing is what
+            // makes running the two concurrently thrash-free; an earlier spawn
+            // without it was reverted for exactly that thrash). The H-3 pre-handshake
+            // gate above has already run for this message; handle_headers serializes
+            // verifies internally (HEADER_VERIFY_SEM) and re-checks the nonce under
+            // the write lock, so moving it off the processor changes no
+            // sync/consensus invariant, only who waits on the CPU.
+            let peers = Arc::clone(peers);
+            let sync = Arc::clone(sync);
+            let chain = chain.clone();
+            let scorer = Arc::clone(scorer);
+            let payload = payload.to_vec();
+            tokio::spawn(async move {
+                if let Err(e) =
+                    headers::handle_headers(peer_id, &payload, &peers, &sync, &chain, &scorer).await
+                {
+                    tracing::warn!("Headers processing error: {e}");
+                }
+            });
         }
 
         MessageType::GetAddr => {

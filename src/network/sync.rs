@@ -91,6 +91,25 @@
 //!   for the last ~300 blocks of every epoch).
 //!   THREAT: none adversarial; IBD throughput.
 //!   TESTS: `download_window_holds_at_key_epoch_boundary`.
+//! - **§10 `mark_headers_received` / `headers_timed_out` / `known_header_hashes` /
+//!   `has_pooled_blocks`**
+//!   — INVARIANT: once the outstanding request's response has arrived the 60 s
+//!   request timeout no longer applies, and the node does not count as idle
+//!   for `arm_near_tip_catchup` while the batch is still being queued; a
+//!   verifier that never finishes is still cut off by
+//!   `HEADERS_VERIFY_CAP_SECS`, and consume, cancel and reset all clear the
+//!   marker. `known_header_hashes` names exactly the hashes
+//!   accepted from a fully verified header batch whose block has not
+//!   committed yet; nothing that only passed the receipt PoW check (a pooled
+//!   block may carry a forged target and must not anchor a header chain).
+//!   THREAT: a 2000-header batch that verifies slower than the timeout being
+//!   discarded and re-requested for ever (seen live 2026-10-11 at height 165).
+//!   `has_pooled_blocks` tells the driver that a received batch is still
+//!   being applied, so it does not ask for the next one yet.
+//!   TESTS: `headers_timeout_pauses_once_response_is_being_verified`,
+//!   `known_header_hashes_track_verified_headers_until_commit`,
+//!   `arm_near_tip_catchup_rearms_stuck_but_not_synced_or_active`,
+//!   `has_pooled_blocks_tracks_the_orphan_pool`.
 
 use crate::consensus::Block;
 use crate::error::Result;
@@ -122,6 +141,12 @@ const MAX_ORPHAN_BLOCKS: usize = 1000;
 const MAX_PENDING_REQUESTS: usize = 10_000;
 const ORPHAN_TTL_SECONDS: u64 = 30 * 60;
 const ORPHAN_CLEANUP_INTERVAL: u64 = 60;
+/// §10 — upper bound on verifying one arrived Headers batch before the
+/// request counts as dead anyway (the plain request timeout is 60 s).
+pub const HEADERS_VERIFY_CAP_SECS: u64 = 600;
+/// §10 — `verified_header_hashes` is cleared past this size; the only cost is
+/// re-verifying headers a peer re-sends.
+const VERIFIED_HEADERS_MAX: usize = 50_000;
 /// Per-peer orphan-block cap.
 ///
 /// SECURITY (2026-07-05 audit F24 — SEV-A, same class as F1 OrphanFlood
@@ -265,6 +290,12 @@ pub struct ChainSync {
     sync_banned_peers: HashMap<PeerId, u64>,
     last_sync_peer: Option<PeerId>,
     headers_request_time: Option<u64>,
+    /// §10 — when the outstanding request's response arrived and went into
+    /// verification. `None` while still waiting for the wire.
+    headers_response_at: Option<u64>,
+    /// §10 — hashes accepted from a fully verified header batch, kept until
+    /// their block commits, so a re-sent header skips the RandomX check.
+    verified_header_hashes: HashSet<Hash>,
     headers_received_this_cycle: bool,
     peer_heights: HashMap<PeerId, u64>,
     /// Outstanding GetHeaders nonces, bound to the peer the request was sent to
@@ -388,6 +419,8 @@ impl ChainSync {
             sync_banned_peers: HashMap::new(),
             last_sync_peer: None,
             headers_request_time: None,
+            headers_response_at: None,
+            verified_header_hashes: HashSet::new(),
             headers_received_this_cycle: false,
             peer_heights: HashMap::new(),
             peer_difficulties: HashMap::new(),
@@ -522,6 +555,7 @@ impl ChainSync {
         {
             self.state = SyncState::Headers;
             self.headers_request_time = None;
+            self.headers_response_at = None;
             self.headers_received_this_cycle = false;
         }
     }
@@ -593,6 +627,7 @@ impl ChainSync {
         ) {
             self.state = SyncState::Headers;
             self.headers_request_time = None;
+            self.headers_response_at = None;
             self.headers_received_this_cycle = false;
         }
     }
@@ -953,6 +988,7 @@ impl ChainSync {
                 if self.true_best_height() > self.local_height + 2 {
                     self.state = SyncState::Headers;
                     self.headers_request_time = None; // Reset timeout to allow re-request
+                    self.headers_response_at = None;
                 }
             }
             return;
@@ -974,6 +1010,13 @@ impl ChainSync {
                 if added_for_peer >= cap {
                     break;
                 }
+            }
+            if peer.is_some() {
+                // §10: only peer responses reach here after full validation.
+                if self.verified_header_hashes.len() >= VERIFIED_HEADERS_MAX {
+                    self.verified_header_hashes.clear();
+                }
+                self.verified_header_hashes.insert(hash);
             }
             if !self.downloading.contains(&hash)
                 && !self.orphan_blocks.contains_key(&hash)
@@ -1482,6 +1525,7 @@ impl ChainSync {
         self.local_height = height;
         self.local_tip = hash;
         self.pending_header_height.remove(&hash);
+        self.verified_header_hashes.remove(&hash);
         // 2026-06-27 fix: re-derive best_known_height after local advance.
         // refresh_best_known computes max(local, max(peers)) so advancing
         // local naturally floors best_known up. Without this, an empty
@@ -1589,6 +1633,7 @@ impl ChainSync {
         self.pending_header_nonces
             .insert(n, (peer, self.header_nonce_generation));
         self.headers_request_time = Some(now);
+        self.headers_response_at = None;
         Some(n)
     }
 
@@ -1603,6 +1648,7 @@ impl ChainSync {
         if matches {
             self.pending_header_nonces.remove(&n);
             self.headers_request_time = None;
+            self.headers_response_at = None;
         }
         matches
     }
@@ -1629,6 +1675,7 @@ impl ChainSync {
             {
                 self.pending_header_nonces.remove(&n);
                 self.headers_request_time = None;
+                self.headers_response_at = None;
                 true
             }
             _ => false,
@@ -1654,9 +1701,43 @@ impl ChainSync {
     }
 
     pub fn headers_timed_out(&self, now: u64) -> bool {
-        self.headers_request_time
-            .map(|t| now > t + 60)
-            .unwrap_or(false)
+        match (self.headers_request_time, self.headers_response_at) {
+            // §10: the response is here and being verified; only a verifier
+            // that never finishes should trip the retry.
+            (Some(_), Some(received)) => now > received + HEADERS_VERIFY_CAP_SECS,
+            (Some(sent), None) => now > sent + 60,
+            (None, _) => false,
+        }
+    }
+
+    /// §10 — the outstanding request's response has arrived from the peer it
+    /// was sent to and is being verified: stop the request timeout. Returns
+    /// false (and changes nothing) when the nonce is not outstanding.
+    pub fn mark_headers_received(&mut self, n: u64, from_peer: &PeerId, now: u64) -> bool {
+        if !self.is_header_nonce_outstanding(n, from_peer) {
+            return false;
+        }
+        if self.headers_response_at.is_none() {
+            self.headers_response_at = Some(now);
+        }
+        true
+    }
+
+    /// §10 — hashes accepted from a fully verified header batch whose block
+    /// has not committed yet. A re-sent header with one of these hashes
+    /// needs no second RandomX check, only to connect. Pooled blocks are
+    /// deliberately not included: the receipt check only proves work
+    /// against the block's own target.
+    pub fn known_header_hashes(&self) -> HashSet<Hash> {
+        self.verified_header_hashes.clone()
+    }
+
+    /// §10 — true while the orphan pool still holds blocks. During IBD the
+    /// pool is where a received batch waits to be applied, and while it
+    /// drains the pending queue and the in-flight set are both empty, which
+    /// the driver would otherwise read as "ask for the next batch".
+    pub fn has_pooled_blocks(&self) -> bool {
+        !self.orphan_blocks.is_empty()
     }
 
     /// Whether a headers request is currently outstanding.
@@ -1691,6 +1772,7 @@ impl ChainSync {
         // testable guard: a Headers response that races this reset arrives with
         // a now-stale generation and is rejected by `validate_header_nonce`.
         self.headers_request_time = None;
+        self.headers_response_at = None;
         self.header_nonce_generation = self.header_nonce_generation.wrapping_add(1);
         self.pending_header_nonces.clear();
     }
@@ -1862,6 +1944,7 @@ impl ChainSync {
                 self.state = SyncState::Headers;
                 self.headers_received_this_cycle = false;
                 self.headers_request_time = None;
+                self.headers_response_at = None;
                 self.blocks_entered_at = None;
                 self.pending_headers.clear();
                 self.requeued_seq.clear();
@@ -1965,6 +2048,7 @@ impl ChainSync {
             self.state = SyncState::Headers;
             self.headers_received_this_cycle = false;
             self.headers_request_time = None;
+            self.headers_response_at = None;
             return true;
         }
         false
@@ -1985,13 +2069,18 @@ impl ChainSync {
     /// and because a re-arm immediately makes us non-idle, repeated InvBlocks
     /// can't churn the cycle. Non-consensus; affects only *when* we fetch.
     pub fn arm_near_tip_catchup(&mut self) -> bool {
+        // §10: a header batch that arrived and is still being verified will
+        // queue more hashes shortly; the queue running dry between its
+        // slices is not idleness.
         let idle = self.pending_headers.is_empty()
             && self.downloading.is_empty()
-            && self.pending_requests.is_empty();
+            && self.pending_requests.is_empty()
+            && self.headers_response_at.is_none();
         if idle && !self.is_synced() {
             self.state = SyncState::Headers;
             self.headers_received_this_cycle = false;
             self.headers_request_time = None;
+            self.headers_response_at = None;
             return true;
         }
         false
@@ -2870,6 +2959,27 @@ mod tests {
         assert!(
             !sync.arm_near_tip_catchup(),
             "must not re-arm while a fetch is in flight"
+        );
+
+        // (4) Behind, queue momentarily empty, but a header batch is still
+        //     being verified (§10) → no-op; once its nonce is consumed → re-arms.
+        let mut sync = ChainSync::new(100, Hash::zero());
+        sync.update_peer_height_for(peers[0], 103);
+        sync.set_state(SyncState::Blocks);
+        let nonce = sync.begin_headers_request(peers[0], 1_000).unwrap();
+        assert!(sync.mark_headers_received(nonce, &peers[0], 1_001));
+        assert!(
+            !sync.arm_near_tip_catchup(),
+            "must not re-arm while a batch is being verified"
+        );
+        assert!(
+            sync.headers_request_pending(),
+            "the outstanding request must survive the no-op"
+        );
+        assert!(sync.validate_header_nonce(nonce, &peers[0]));
+        assert!(
+            sync.arm_near_tip_catchup(),
+            "re-arms once the batch is fully queued"
         );
     }
 
@@ -4223,6 +4333,158 @@ mod tests {
             sync.get_blocks_to_request(10),
             hashes[2..].to_vec(),
             "released at the boundary"
+        );
+    }
+
+    /// §10: an arrived batch is not timed out while it verifies, a stuck
+    /// verifier still is, and consuming the nonce clears the marker.
+    #[test]
+    fn headers_timeout_pauses_once_response_is_being_verified() {
+        let mut sync = ChainSync::new(0, Hash::zero());
+        let peer = super::super::peer::generate_peer_id();
+        let other = super::super::peer::generate_peer_id();
+        let nonce = sync.begin_headers_request(peer, 1_000).unwrap();
+        assert!(
+            sync.headers_timed_out(1_061),
+            "no response: plain 60 s timeout"
+        );
+        assert!(
+            !sync.mark_headers_received(nonce, &other, 1_030),
+            "a different peer cannot mark the request"
+        );
+        assert!(sync.headers_timed_out(1_061));
+        assert!(sync.mark_headers_received(nonce, &peer, 1_030));
+        assert!(
+            !sync.headers_timed_out(1_061),
+            "arrived batch is being verified"
+        );
+        assert!(
+            sync.headers_timed_out(1_030 + HEADERS_VERIFY_CAP_SECS + 1),
+            "a verifier that never finishes still times out"
+        );
+        assert!(sync.validate_header_nonce(nonce, &peer));
+        assert!(
+            !sync.headers_timed_out(1_000_000),
+            "consumed: nothing outstanding"
+        );
+        assert!(
+            !sync.mark_headers_received(nonce, &peer, 1_040),
+            "a consumed nonce cannot be marked"
+        );
+        let next = sync.begin_headers_request(peer, 2_000).unwrap();
+        assert!(
+            sync.headers_timed_out(2_061),
+            "a fresh request starts unmarked"
+        );
+        assert!(sync.mark_headers_received(next, &peer, 2_010));
+        sync.reset_headers_timeout();
+        assert!(
+            !sync.headers_timed_out(1_000_000),
+            "reset clears the marker too"
+        );
+    }
+
+    /// §10: the verified set is what a peer's accepted batch queued, it
+    /// survives the pop into `downloading`, a pooled block that was never in
+    /// a verified batch is not in it, and a commit forgets the hash.
+    #[test]
+    fn known_header_hashes_track_verified_headers_until_commit() {
+        use crate::consensus::BlockHeader;
+        use crate::primitives::PublicKey;
+
+        let mut sync = ChainSync::new(0, Hash::zero());
+        let peer = super::super::peer::generate_peer_id();
+        sync.update_peer_height_for(peer, 100);
+        let queued: Vec<Hash> = (1..=3u8).map(|i| Hash::from_bytes([i; 32])).collect();
+        sync.queue_headers_from_peer(peer, queued.clone());
+        let orphan = Block {
+            header: BlockHeader {
+                network_magic: crate::config::NetworkType::Testnet.magic_bytes(),
+                version: 1,
+                height: crate::primitives::Height::new(50),
+                timestamp: crate::primitives::Timestamp::from_secs(1_050),
+                prev_hash: Hash::from_bytes([0xAA; 32]),
+                tx_root: Hash::zero(),
+                anchor: Hash::zero(),
+                algorithm: 0,
+                nonce: 7,
+                target: Hash::from_bytes([0xFF; 32]),
+                miner_pubkey: PublicKey::from_bytes([0u8; 32]),
+                supply_commitment: [0u8; 32],
+                checkpoint_vote: None,
+                spark_set_root: [0u8; 32],
+                mw_kernel_root: [0u8; 32],
+            },
+            transactions: vec![],
+        };
+        let orphan_hash = orphan.hash();
+        sync.mark_block_orphan(orphan, None, &Hash::zero());
+        // Self-attributed queueing (re-queue paths) does not vouch for a hash.
+        sync.queue_headers(vec![Hash::from_bytes([8; 32])]);
+
+        let known = sync.known_header_hashes();
+        for h in &queued {
+            assert!(known.contains(h), "queued from a verified batch");
+        }
+        assert!(
+            !known.contains(&orphan_hash),
+            "a pooled block is not vouched for"
+        );
+        assert!(!known.contains(&Hash::from_bytes([8; 32])));
+        assert!(!known.contains(&Hash::from_bytes([9; 32])));
+
+        let popped = sync.get_blocks_to_request(1);
+        assert_eq!(popped, vec![queued[0]]);
+        assert!(
+            sync.known_header_hashes().contains(&queued[0]),
+            "still verified while in flight"
+        );
+        sync.on_block_processed(queued[0], 1);
+        assert!(
+            !sync.known_header_hashes().contains(&queued[0]),
+            "forgotten once committed"
+        );
+    }
+
+    /// §10: the pool flag follows the orphan pool, so the driver can tell a
+    /// draining pool from an empty queue.
+    #[test]
+    fn has_pooled_blocks_tracks_the_orphan_pool() {
+        use crate::consensus::BlockHeader;
+        use crate::primitives::PublicKey;
+
+        let mut sync = ChainSync::new(0, Hash::zero());
+        assert!(!sync.has_pooled_blocks());
+        let parent = Hash::from_bytes([0xAA; 32]);
+        let orphan = Block {
+            header: BlockHeader {
+                network_magic: crate::config::NetworkType::Testnet.magic_bytes(),
+                version: 1,
+                height: crate::primitives::Height::new(50),
+                timestamp: crate::primitives::Timestamp::from_secs(1_050),
+                prev_hash: parent,
+                tx_root: Hash::zero(),
+                anchor: Hash::zero(),
+                algorithm: 0,
+                nonce: 7,
+                target: Hash::from_bytes([0xFF; 32]),
+                miner_pubkey: PublicKey::from_bytes([0u8; 32]),
+                supply_commitment: [0u8; 32],
+                checkpoint_vote: None,
+                spark_set_root: [0u8; 32],
+                mw_kernel_root: [0u8; 32],
+            },
+            transactions: vec![],
+        };
+        sync.mark_block_orphan(orphan, None, &Hash::zero());
+        assert!(
+            sync.has_pooled_blocks(),
+            "a pooled block is still to be applied"
+        );
+        assert_eq!(sync.take_orphans_of(parent).len(), 1);
+        assert!(
+            !sync.has_pooled_blocks(),
+            "taken for processing: pool empty"
         );
     }
 }

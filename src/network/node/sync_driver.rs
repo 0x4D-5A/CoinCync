@@ -19,11 +19,13 @@
 //!   TESTS: `emergency_recovery_respects_progress_and_thresholds`.
 //! - **§2 `run_headers_tick` pending-request gate** — INVARIANT: the tick
 //!   loop checks `headers_request_pending()` and returns early rather than
-//!   issuing a second concurrent GetHeaders.
+//!   issuing a second concurrent GetHeaders, and does not ask while the pool
+//!   is still applying a received batch (`headers_tick_deferred`).
 //!   THREAT: Finding #3 headers-request flood — the pre-fix loop sent
 //!   GetHeaders unconditionally every tick (~4 Hz hammer) while stuck on a
 //!   fork, exhausting CPU.
-//!   TESTS: `regression_finding_03_ibd_loop_gates_on_pending`.
+//!   TESTS: `regression_finding_03_ibd_loop_gates_on_pending`,
+//!   `headers_tick_waits_for_the_pool_to_drain`.
 //! - **§3 EMERGENCY-TIER-3 branch (`spawn_sync_driver` main loop)** —
 //!   INVARIANT: when the chain has not advanced for
 //!   `EMERGENCY_T3_NO_PROGRESS_SECS` despite `is_stalled()` reporting false,
@@ -483,6 +485,8 @@ struct SyncDriverState {
     /// this value between ticks; the stall detector treats that as progress so a
     /// heavier-fork download is not aborted by the 60-tick Headers bounce.
     last_blocks_delivered: u64,
+    /// §2 — tip height at the last headers-state tick (`headers_tick_deferred`).
+    headers_gate_height: u64,
     /// §8 — IBD progress display (bar / periodic log). Display-only; see
     /// `IbdProgress`.
     ibd_progress: IbdProgress,
@@ -501,6 +505,7 @@ impl SyncDriverState {
             last_progress_time_secs: 0,
             emergency_t3_fires: 0,
             last_blocks_delivered: 0,
+            headers_gate_height: height,
             ibd_progress: IbdProgress::new(),
         }
     }
@@ -975,16 +980,32 @@ pub(super) fn spawn_sync_driver(
 
             match state {
                 SyncState::Idle | SyncState::Headers | SyncState::ConfirmingSynced => {
-                    run_headers_tick(
-                        state,
-                        &sync_peers,
-                        &sync_senders,
-                        &sync_chain,
-                        &sync_sync,
-                        &sync_scorer,
-                        magic,
-                    )
-                    .await;
+                    // §2: a received batch is still being applied out of the
+                    // pool (queue and in-flight set empty, tip moving). Asking
+                    // now only fetches headers we already hold.
+                    let height = sync_chain.height();
+                    let tip_advanced = height > driver.headers_gate_height;
+                    driver.headers_gate_height = height;
+                    if headers_tick_deferred(
+                        tip_advanced,
+                        sync_sync.read().await.has_pooled_blocks(),
+                    ) {
+                        debug!(
+                            "[IBD] headers tick deferred at height {}: pool still applying",
+                            height
+                        );
+                    } else {
+                        run_headers_tick(
+                            state,
+                            &sync_peers,
+                            &sync_senders,
+                            &sync_chain,
+                            &sync_sync,
+                            &sync_scorer,
+                            magic,
+                        )
+                        .await;
+                    }
                 }
                 SyncState::Blocks => {
                     // ============================================================
@@ -1122,6 +1143,14 @@ pub(super) fn spawn_sync_driver(
         // a fresh line so the shell prompt doesn't land on the half-drawn bar.
         driver.ibd_progress.on_shutdown();
     })
+}
+
+/// §2 — true when a GetHeaders would only re-fetch what the pool is still
+/// applying: the tip moved since the last headers-state tick (so the pool is
+/// draining, not stuck on unrelated blocks) and the pool is not empty. A pool
+/// that does not move the tip never defers, so it cannot wedge the header pull.
+fn headers_tick_deferred(tip_advanced: bool, pooled: bool) -> bool {
+    tip_advanced && pooled
 }
 
 async fn run_headers_tick(
@@ -1360,6 +1389,16 @@ async fn run_synced_tick(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// §2: the headers tick waits only while the pool is draining (tip moving
+    /// and blocks pooled); a stuck pool or an empty one never defers.
+    #[test]
+    fn headers_tick_waits_for_the_pool_to_drain() {
+        assert!(headers_tick_deferred(true, true));
+        assert!(!headers_tick_deferred(false, true), "pool but no progress");
+        assert!(!headers_tick_deferred(true, false), "progress but no pool");
+        assert!(!headers_tick_deferred(false, false));
+    }
 
     #[test]
     fn emergency_recovery_respects_progress_and_thresholds() {
