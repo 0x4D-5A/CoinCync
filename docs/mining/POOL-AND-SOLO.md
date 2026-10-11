@@ -79,7 +79,7 @@ coincync-node --network mainnet --stratum 0.0.0.0:3333 --stratum-address <POOL_A
 | Pool-wide **share difficulty** (job carries a share target below the block target) | ✅ done (`share_difficulty`, default 1000) |
 | Per-miner **share accounting** for reward-splitting | ✅ done (difficulty-weighted, `StratumServer::share_tally()`) |
 | Per-worker **adaptive vardiff** (per-connection target that tracks its hashrate) | ⛔ not yet (single pool-wide share target) |
-| Extranonce partitioning (avoid overlap at large scale) | ⛔ not yet |
+| Extranonce partitioning (avoid overlap at large scale) | partial: each rig starts at a random nonce, so rigs do not search the same nonces; server-assigned disjoint ranges not yet |
 | Client auto-reconnect | ⛔ not yet (supervise the client) |
 
 So today the reference pool measures each miner's contribution (weighted shares
@@ -167,7 +167,8 @@ Ordered upgrades to move the reference pool from "great for my boxes" to
    and adjust it to its measured hashrate, so a laptop and a farm both submit at
    a steady rate and the share tally is fair across mixed hardware.
 4. **Extranonce partitioning** — hand each miner a disjoint nonce region so a
-   large farm doesn't waste hashrate on overlap.
+   large farm doesn't waste hashrate on overlap (today each rig starts at a
+   random nonce, which removes the overlap for a small pool).
 5. **Client auto-reconnect** — the client reconnects on a dropped pool link.
 6. **Fold the PPLNS window** (`src/mining/pool.rs`) into the stratum server —
    time-windowed share weighting on top of the tally above — then delete that

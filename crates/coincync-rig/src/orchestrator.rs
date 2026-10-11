@@ -929,9 +929,10 @@ async fn mine_parallel(
     deadline: Instant,
     // Offset added to each thread's slice start. 0 for solo (every template is
     // a fresh input, so restarting from the slice start is fine). The stratum
-    // pool client advances this each call so repeated searches of the SAME job
-    // don't re-test identical nonces. It grows far slower than the slice size
-    // (u64::MAX / threads), so threads never cross into each other's slices.
+    // pool client starts it at a random value so two rigs on one pool do not
+    // search the same nonces, and advances it each call so repeated searches
+    // of the SAME job don't re-test identical nonces. It is reduced modulo the
+    // slice size, so threads never cross into each other's slices.
     nonce_base: u64,
     // Tip-abort (Ghost-Bridge Stream 1). When `Some`, the async race polls this
     // daemon's tip every 2s and aborts the search the instant the chain reaches
@@ -963,7 +964,7 @@ async fn mine_parallel(
         let found_tx = found_tx.clone();
         let input = input.clone();
         let slice_start = (tid as u64).saturating_mul(slice);
-        let start_nonce = slice_start.wrapping_add(nonce_base);
+        let start_nonce = slice_start_nonce(slice_start, slice, nonce_base);
         // End at the NEXT slice boundary (independent of nonce_base), so the
         // base only shifts where within the slice we search, never the slice's
         // extent.
@@ -1263,6 +1264,13 @@ fn pool_job_seed_ok(job: &PoolJob) -> bool {
     coincync::consensus::randomx_seed_for_height(job.height) == job.seed_hash
 }
 
+/// Where thread `tid`'s search starts: its slice start plus `nonce_base`
+/// reduced into the slice, so any base (a random pool start, or one advanced
+/// past the slice size) stays inside `[slice_start, slice_start + slice)`.
+fn slice_start_nonce(slice_start: u64, slice: u64, nonce_base: u64) -> u64 {
+    slice_start.saturating_add(nonce_base % slice.max(1))
+}
+
 /// Connect to a CoinCync stratum pool, log in, and mine the jobs it pushes,
 /// submitting winning nonces. Reuses the SAME `mine_parallel` engine as solo
 /// mining — only the job source differs (the pool's `job` messages instead of
@@ -1363,7 +1371,12 @@ pub async fn run_pool(
     });
 
     let hasher = Hasher::new();
-    let mut nonce_base: u64 = 0;
+    // Start at a random nonce: two rigs on the same pool get the same job and,
+    // with the same thread count, would otherwise hash identical nonces and
+    // trade "duplicate share" rejections (server-assigned ranges are the
+    // roadmap item that replaces this).
+    let mut nonce_base: u64 = rand::random();
+    info!("pool: nonce base {:#018x}", nonce_base);
     let mut submit_id: u64 = 2;
     loop {
         let job = { job_slot.lock().await.clone() };
@@ -1464,6 +1477,23 @@ use PowAlgorithm as _PowAlgorithmStillUsedTransitively;
 #[cfg(test)]
 mod tests {
     use coincync::mining::{fork_diverged, FORK_DIVERGENCE_MARGIN};
+    use super::slice_start_nonce;
+
+    #[test]
+    fn slice_start_nonce_keeps_any_base_inside_the_slice() {
+        let slice = u64::MAX / 4;
+        for tid in 0..4u64 {
+            let start = tid * slice;
+            assert_eq!(slice_start_nonce(start, slice, 0), start);
+            for base in [1, slice - 1, slice, slice + 7, u64::MAX] {
+                let n = slice_start_nonce(start, slice, base);
+                assert!(
+                    n >= start && n < start + slice,
+                    "tid {tid} base {base}: {n}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn no_peer_height_is_not_divergence() {
