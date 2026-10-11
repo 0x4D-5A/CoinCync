@@ -585,6 +585,7 @@ pub(super) async fn handle_connection(
                                 peer_id,
                                 msg_type: message.msg_type,
                                 payload: message.payload,
+                                received_at: crate::clock::mono_now(),
                                 _reservation: message.reservation,
                             })
                             .await

@@ -52,8 +52,6 @@
 //!   TESTS: (gap — no dedicated `handle_block_data` test in this file's
 //!   `#[cfg(test)] mod tests` or the listed integration suites).
 
-use std::time::Duration;
-
 use dashmap::DashMap;
 use tokio::sync::{broadcast, mpsc, RwLock};
 use tracing::{debug, info, warn};
@@ -556,7 +554,7 @@ pub(super) async fn handle_blocks(
                         .write()
                         .await
                         .get_or_create(addr)
-                        .record_block_success(Duration::from_millis(100));
+                        .record_block_success();
                 }
                 let _ = event_tx.send(NodeEvent::BlockReceived(block, peer_id));
             }
@@ -738,7 +736,7 @@ pub(super) async fn handle_block_data(
                 .write()
                 .await
                 .get_or_create(addr)
-                .record_block_success(Duration::from_millis(100));
+                .record_block_success();
         }
         // Credit this peer's inbound block-relay score (Phase 1: measure
         // only — not yet consulted by eviction). Public block delivery is

@@ -103,6 +103,15 @@
 //!   TESTS: `top_peers_for_download_filters_unvalidated_and_low_score`,
 //!   `peers_by_latency_filters_unvalidated_and_orders_ascending`,
 //!   `test_peer_scorer`.
+//! - **§11 `record_ping_sent` / `record_pong` latency measurement** —
+//!   INVARIANT: `latency_ms` only moves on a Pong whose nonce matches the
+//!   Ping we recorded for that peer; the first sample replaces the 1000 ms
+//!   placeholder, later ones are averaged (alpha 0.3); a nonce is single use.
+//!   THREAT: a peer forging or replaying Pongs to lower its latency term
+//!   (25% of `composite_score`) and win header-request selection.
+//!   TESTS: `pong_with_matching_nonce_measures_latency`,
+//!   `pong_with_wrong_nonce_is_ignored`,
+//!   `latency_averages_after_the_first_sample`.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -396,7 +405,7 @@ pub fn classify_invalid_tx_reason(reason: &str) -> MisbehaviorType {
 pub struct PeerScore {
     /// Base reputation (-100 to 100)
     pub reputation: i32,
-    /// Average response latency in milliseconds
+    /// Ping/Pong round-trip time in milliseconds (moving average)
     pub latency_ms: u32,
     /// Block delivery speed (blocks per second)
     pub block_speed: f64,
@@ -438,6 +447,12 @@ pub struct PeerScore {
     /// instant in the variant. Auto-expires (cleared by `is_get_blocks_banned`)
     /// so peers that recover from their own resync get another shot.
     pub get_blocks_banned_until: Option<MonoInstant>,
+    /// Nonce and send time of the last Ping we sent this peer, cleared by the
+    /// matching Pong (see `record_pong`).
+    ping_sent: Option<(u64, MonoInstant)>,
+    /// Round trips measured so far. The first one replaces the 1000 ms
+    /// placeholder instead of averaging with it.
+    latency_samples: u32,
 }
 
 impl Default for PeerScore {
@@ -459,6 +474,8 @@ impl Default for PeerScore {
             reconnects: 0,
             consecutive_empty_blocks: 0,
             get_blocks_banned_until: None,
+            ping_sent: None,
+            latency_samples: 0,
         }
     }
 }
@@ -717,14 +734,33 @@ impl PeerScore {
     /// completed handshake. Without this, is_good() never returns true for
     /// peers that skip the handshake-validation path (e.g., inbound connections
     /// that start sending blocks before the scorer sees the handshake event).
-    pub fn record_block_success(&mut self, latency: Duration) {
+    pub fn record_block_success(&mut self) {
         self.blocks_delivered += 1;
         self.last_success = Some(mono_now());
         self.validated = true; // H-15 FIX: delivering valid block = validated
         self.consecutive_empty_blocks = 0; // a real delivery clears the wedge counter
-        self.update_latency(latency);
         self.update_validity_rate();
         self.adjust_reputation(2);
+    }
+
+    /// Remember the nonce of the Ping we just sent so the Pong can be matched.
+    pub fn record_ping_sent(&mut self, nonce: u64) {
+        self.ping_sent = Some((nonce, mono_now()));
+    }
+
+    /// A Pong arrived at `received_at` (stamped when the frame came off the
+    /// socket, before it queued behind other work). If its nonce is the one we
+    /// are waiting for, fold the round-trip time into `latency_ms` and return
+    /// it. Anything else (stale, unsolicited, forged) is ignored, so a peer
+    /// cannot talk its own latency down with pongs we never asked for.
+    pub fn record_pong(&mut self, nonce: u64, received_at: MonoInstant) -> Option<Duration> {
+        if !matches!(self.ping_sent, Some((expected, _)) if expected == nonce) {
+            return None;
+        }
+        let (_, sent_at) = self.ping_sent.take()?;
+        let rtt = received_at.saturating_duration_since(sent_at);
+        self.update_latency(rtt);
+        Some(rtt)
     }
 
     /// Record a failed/invalid block
@@ -836,11 +872,18 @@ impl PeerScore {
         );
     }
 
-    /// Update average latency with exponential moving average
+    /// Update average latency with exponential moving average. The first
+    /// measurement replaces the 1000 ms placeholder outright; averaging with
+    /// it would take about ten pings (20 minutes) to get near the real value.
     fn update_latency(&mut self, latency: Duration) {
         let new_latency = latency.as_millis().min(u32::MAX as u128) as u32;
-        // EMA with alpha = 0.3 (more weight on recent)
-        self.latency_ms = ((self.latency_ms as f64 * 0.7) + (new_latency as f64 * 0.3)) as u32;
+        if self.latency_samples == 0 {
+            self.latency_ms = new_latency;
+        } else {
+            // EMA with alpha = 0.3 (more weight on recent)
+            self.latency_ms = ((self.latency_ms as f64 * 0.7) + (new_latency as f64 * 0.3)) as u32;
+        }
+        self.latency_samples = self.latency_samples.saturating_add(1);
     }
 
     /// Update validity rate
@@ -1192,6 +1235,57 @@ mod tests {
     }
 
     #[test]
+    fn pong_with_matching_nonce_measures_latency() {
+        let mut score = PeerScore::default();
+        assert_eq!(score.latency_ms, 1000, "placeholder until measured");
+        score.record_ping_sent(42);
+        let received_at = mono_now() + Duration::from_millis(40);
+        let rtt = score
+            .record_pong(42, received_at)
+            .expect("matching nonce is accepted");
+        assert_eq!(
+            score.latency_ms,
+            rtt.as_millis() as u32,
+            "first sample replaces the placeholder"
+        );
+        assert!(
+            (40..1000).contains(&score.latency_ms),
+            "{}",
+            score.latency_ms
+        );
+        assert!(
+            score.record_pong(42, received_at).is_none(),
+            "a nonce is single use"
+        );
+    }
+
+    #[test]
+    fn pong_with_wrong_nonce_is_ignored() {
+        let mut score = PeerScore::default();
+        score.record_ping_sent(7);
+        let now = mono_now();
+        assert!(score.record_pong(8, now).is_none(), "wrong nonce");
+        assert_eq!(score.latency_ms, 1000, "latency untouched");
+        assert!(
+            score.record_pong(7, now).is_some(),
+            "the real pong still counts"
+        );
+        assert!(
+            score.record_pong(7, now).is_none(),
+            "nothing outstanding any more"
+        );
+    }
+
+    #[test]
+    fn latency_averages_after_the_first_sample() {
+        let mut score = PeerScore::default();
+        score.update_latency(Duration::from_millis(100));
+        assert_eq!(score.latency_ms, 100);
+        score.update_latency(Duration::from_millis(200));
+        assert_eq!(score.latency_ms, 130, "0.7 * 100 + 0.3 * 200");
+    }
+
+    #[test]
     fn test_peer_scorer() {
         let mut scorer = PeerScorer::new();
         let addr = test_addr(8080);
@@ -1201,7 +1295,7 @@ mod tests {
             let score = scorer.get_or_create(addr);
             score.validated = true;
             score.reputation = 80;
-            score.record_block_success(Duration::from_millis(50));
+            score.record_block_success();
         }
 
         // Check it's in top peers
@@ -1298,7 +1392,7 @@ mod tests {
         );
 
         // Successful delivery resets the counter.
-        score.record_block_success(Duration::from_millis(100));
+        score.record_block_success();
         assert_eq!(
             score.consecutive_empty_blocks, 0,
             "real delivery clears the wedge counter"
@@ -2043,7 +2137,7 @@ mod tests {
         }
         assert_eq!(score.consecutive_empty_blocks, EMPTY_BLOCKS_BAN_THRESHOLD - 1);
 
-        score.record_block_success(Duration::from_millis(20));
+        score.record_block_success();
         assert_eq!(
             score.consecutive_empty_blocks, 0,
             "a real delivery clears the empty-blocks wedge counter"

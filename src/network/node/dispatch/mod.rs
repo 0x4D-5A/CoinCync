@@ -77,6 +77,7 @@ pub(super) async fn process_message(
     peer_id: PeerId,
     msg_type_id: u8,
     payload: &[u8],
+    received_at: crate::clock::MonoInstant,
     magic: [u8; 4],
     our_nonce: u64,
     // `peers` / `sync` / `scorer` are `&Arc<…>` (not `&…`); every handler call below
@@ -205,7 +206,9 @@ pub(super) async fn process_message(
             control::handle_ping(peer_id, payload, magic, peers, senders, scorer).await?;
         }
 
-        MessageType::Pong => control::handle_pong(),
+        MessageType::Pong => {
+            control::handle_pong(peer_id, payload, received_at, peers, scorer).await;
+        }
 
         MessageType::GetHeaders => {
             headers::handle_get_headers(peer_id, payload, magic, peers, senders, chain, scorer)
@@ -436,6 +439,7 @@ mod router_tests {
             peer_id,
             msg_type_id,
             &payload,
+            crate::clock::mono_now(),
             [1, 2, 3, 4],
             0,
             &peers,

@@ -12,8 +12,10 @@
 //!   TESTS: (gap — no test panics the inner loop and asserts the supervisor
 //!   logs CRITICAL rather than exiting quietly).
 //! - **§2 `run_ping_tick`** — INVARIANT: every ping interval, a keepalive is
-//!   sent to all current senders and expired tx-absence entries are pruned,
-//!   using a best-effort send (dead channels don't abort the tick).
+//!   sent to all current senders, each with its own nonce recorded in the
+//!   peer's score so `handle_pong` can time the round trip, and expired
+//!   tx-absence entries are pruned, using a best-effort send (dead channels
+//!   don't abort the tick).
 //!   THREAT: without periodic pings, `PEER_TIMEOUT`-based liveness on the
 //!   remote side evicts us even on a healthy link; without pruning, the
 //!   tx-absence cache grows unbounded between hard-cap evictions.
@@ -262,7 +264,14 @@ pub(super) fn spawn_maintenance(
                 biased;
                 _ = wait_for_shutdown(&mut shutdown) => break,
                 _ = ping_interval.tick() => {
-                    run_ping_tick(&maint_senders, &maint_tx_absence_cache, magic).await;
+                    run_ping_tick(
+                        &maint_senders,
+                        &maint_peers,
+                        &maint_scorer,
+                        &maint_tx_absence_cache,
+                        magic,
+                    )
+                    .await;
                 }
 
                 _ = relay_score_interval.tick() => {
@@ -367,17 +376,36 @@ pub(super) fn spawn_maintenance(
 
 async fn run_ping_tick(
     senders: &DashMap<PeerId, mpsc::Sender<Vec<u8>>>,
+    peers: &DashMap<PeerId, PeerInfo>,
+    scorer: &RwLock<PeerScorer>,
     tx_absence_cache: &parking_lot::RwLock<TxAbsenceCache>,
     magic: [u8; 4],
 ) {
-    if let Ok(data) = Message::ping(magic).to_bytes() {
-        let snapshot: Vec<mpsc::Sender<Vec<u8>>> = senders
-            .iter()
-            .map(|sender| sender.value().clone())
-            .collect();
-        for sender in snapshot {
-            let _ = sender.send(data.clone()).await;
+    // One nonce per peer, remembered in its score with the time we hand the
+    // Ping to its queue: the Pong that echoes it gives us the round-trip time
+    // (see dispatch::control::handle_pong).
+    let snapshot: Vec<_> = senders
+        .iter()
+        .map(|entry| {
+            let addr = peers.get(entry.key()).map(|p| p.addr);
+            (entry.value().clone(), addr)
+        })
+        .collect();
+    let mut pings = Vec::with_capacity(snapshot.len());
+    {
+        let mut scorer = scorer.write().await;
+        for (sender, addr) in snapshot {
+            let nonce = rand::random::<u64>();
+            if let Ok(data) = Message::ping_with_nonce(magic, nonce).to_bytes() {
+                if let Some(addr) = addr {
+                    scorer.get_or_create(addr).record_ping_sent(nonce);
+                }
+                pings.push((sender, data));
+            }
         }
+    }
+    for (sender, data) in pings {
+        let _ = sender.send(data).await;
     }
 
     let pruned = tx_absence_cache.write().prune();
