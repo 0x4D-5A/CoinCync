@@ -6826,7 +6826,9 @@
         "threat": "a structurally-valid header with forged or missing PoW being queued for sync.",
         "tags": [],
         "tests": [
-          "accepts_connected_header_with_valid_pow"
+          "accepts_connected_header_with_valid_pow",
+          "chunked_validation_matches_whole_batch",
+          "known_hash_skips_pow_but_must_connect"
         ],
         "gap": false,
         "adversarial": true,
@@ -6857,7 +6859,8 @@
         "tests": [
           "handle_headers_cross_peer_nonce_is_rejected_without_consuming",
           "handle_headers_valid_nonce_is_single_use",
-          "handle_headers_unsolicited_nonce_zero_is_ignored"
+          "handle_headers_unsolicited_nonce_zero_is_ignored",
+          "handle_headers_rejected_batch_releases_nonce"
         ],
         "gap": false,
         "adversarial": true,
@@ -6875,6 +6878,22 @@
         ],
         "gap": false,
         "adversarial": true,
+        "proven": false,
+        "color": "yellow"
+      },
+      {
+        "num": 9,
+        "name": "handle_headers",
+        "invariant": "a Headers batch is verified in HEADER_VERIFY_CHUNK slices and every verified slice is queued at once, so block requests start while the rest of the batch is still being checked; a slice is never verified in a later RandomX key epoch than the block after our tip; hashes the engine already verified are not RandomX-checked again.",
+        "threat": "none adversarial; ~45 s of IBD dead time per 2000 headers and the one-block-per-second crawl before every key-epoch boundary.",
+        "tags": [],
+        "tests": [
+          "chunked_validation_matches_whole_batch",
+          "chunked_validation_reports_absolute_index",
+          "handle_headers_streams_verified_prefix_and_consumes_nonce"
+        ],
+        "gap": false,
+        "adversarial": false,
         "proven": false,
         "color": "yellow"
       }
@@ -7524,11 +7543,12 @@
       {
         "num": 2,
         "name": "run_headers_tick",
-        "invariant": "the tick loop checks `headers_request_pending()` and returns early rather than issuing a second concurrent GetHeaders.",
+        "invariant": "the tick loop checks `headers_request_pending()` and returns early rather than issuing a second concurrent GetHeaders. The tick also does not ask while the pool is still applying a received batch (headers_tick_deferred).",
         "threat": "Finding #3 headers-request flood \u2014 the pre-fix loop sent GetHeaders unconditionally every tick (~4 Hz hammer) while stuck on a fork, exhausting CPU.",
         "tags": [],
         "tests": [
-          "regression_finding_03_ibd_loop_gates_on_pending"
+          "regression_finding_03_ibd_loop_gates_on_pending",
+          "headers_tick_waits_for_the_pool_to_drain"
         ],
         "gap": false,
         "adversarial": true,
@@ -9057,6 +9077,23 @@
         "tags": [],
         "tests": [
           "download_window_holds_at_key_epoch_boundary"
+        ],
+        "gap": false,
+        "adversarial": false,
+        "proven": false,
+        "color": "yellow"
+      },
+      {
+        "num": 10,
+        "name": "mark_headers_received",
+        "invariant": "once the outstanding request's response has arrived the 60 s request timeout no longer applies and the node is not idle for arm_near_tip_catchup while the batch is still being queued; a verifier that never finishes is still cut off by HEADERS_VERIFY_CAP_SECS; consume, cancel and reset clear the marker; known_header_hashes names exactly the hashes accepted from a fully verified header batch whose block has not committed yet (never a merely pooled block, whose receipt check only proves work against its own target). has_pooled_blocks reports a received batch still being applied so the driver does not ask for the next one yet.",
+        "threat": "a 2000-header batch that verifies slower than the timeout being discarded and re-requested for ever (seen live 2026-10-11 at height 165).",
+        "tags": [],
+        "tests": [
+          "headers_timeout_pauses_once_response_is_being_verified",
+          "known_header_hashes_track_verified_headers_until_commit",
+          "arm_near_tip_catchup_rearms_stuck_but_not_synced_or_active",
+          "has_pooled_blocks_tracks_the_orphan_pool"
         ],
         "gap": false,
         "adversarial": false,

@@ -225,10 +225,14 @@ pub(super) async fn handle_inv_block(
                 // back with the very range we are already pulling. Deep in IBD
                 // the peer announces every block it mines, so this path kept
                 // re-verifying the same headers and stalled block processing for
-                // the whole batch each time. Refresh only once the queue has
-                // drained; the driver's drained-queue path and the peer's
-                // ChainWork announcements keep the sync target current meanwhile.
-                let queue_busy = sync.read().await.pending_count() > 0;
+                // the whole batch each time. Refresh only once the queue and
+                // the pool have drained; the driver's drained-queue path and the
+                // peer's ChainWork announcements keep the sync target current
+                // meanwhile.
+                let queue_busy = {
+                    let sg = sync.read().await;
+                    sg.pending_count() > 0 || sg.has_pooled_blocks()
+                };
                 let locator = build_locator(our_height, |h| chain.get_block_hash(h));
                 if !locator.is_empty() && !queue_busy {
                     let now = chrono::Utc::now().timestamp() as u64;
