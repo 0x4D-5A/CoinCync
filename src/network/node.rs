@@ -1312,6 +1312,7 @@ impl P2PNode {
                 scorer: &self.peer_scorer,
                 dandelion: &self.dandelion,
                 orphan_flood: &self.orphan_flood,
+                sync: &self.sync,
                 event_tx: &self.event_tx,
             },
         )
