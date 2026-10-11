@@ -83,6 +83,14 @@
 //!   `header_nonce_rejected_after_generation_reset`,
 //!   `header_nonce_cancelled_send_allows_immediate_retry`,
 //!   `header_nonce_unsolicited_rejected`.
+//! - **§9 `get_blocks_to_request` key-epoch hold (`note_header_heights`,
+//!   `crosses_key_epoch`)** — INVARIANT: the download window never runs
+//!   past a RandomX key-epoch boundary until the tip is one block below
+//!   it, so blocks of two epochs do not alternate through the single-slot
+//!   light cache (a 0.4 s rebuild per flip; IBD crawled at 1-6 blocks/s
+//!   for the last ~300 blocks of every epoch).
+//!   THREAT: none adversarial; IBD throughput.
+//!   TESTS: `download_window_holds_at_key_epoch_boundary`.
 
 use crate::consensus::Block;
 use crate::error::Result;
@@ -229,6 +237,10 @@ pub struct ChainSync {
     /// MAX_HEADERS_PER_PEER. Kept in sync with `pending_header_peer`
     /// — invariant: count == pending_header_peer values matching this peer.
     headers_per_peer: HashMap<PeerId, usize>,
+    /// §9 — heights of queued headers, so `get_blocks_to_request` can
+    /// hold the window at a RandomX key-epoch boundary. Filled by
+    /// `note_header_heights`; an entry leaves with its pop or its commit.
+    pending_header_height: HashMap<Hash, u64>,
     downloading: HashSet<Hash>,
     download_timestamps: HashMap<Hash, DownloadEntry>,
     /// Monotonic counter stamped on every hash as it leaves `pending_headers`.
@@ -364,6 +376,7 @@ impl ChainSync {
             pending_headers: VecDeque::new(),
             pending_header_peer: HashMap::new(),
             headers_per_peer: HashMap::new(),
+            pending_header_height: HashMap::new(),
             downloading: HashSet::new(),
             download_timestamps: HashMap::new(),
             next_request_seq: 0,
@@ -402,6 +415,10 @@ impl ChainSync {
         self.last_orphan_cleanup = current_time;
 
         let cutoff = current_time.saturating_sub(ORPHAN_TTL_SECONDS);
+        // §9: heights are only needed above the tip.
+        let tip = self.local_height;
+        self.pending_header_height.retain(|_, h| *h > tip);
+
         let expired: Vec<(Hash, Hash)> = self
             .orphan_blocks
             .iter()
@@ -916,6 +933,16 @@ impl ChainSync {
         self.queue_headers_inner(headers, Some(peer));
     }
 
+    /// §9 — remember the heights of validated headers before queueing
+    /// them. Heights at or below the tip are not needed.
+    pub fn note_header_heights(&mut self, heights: &[(Hash, u64)]) {
+        for (hash, height) in heights {
+            if *height > self.local_height {
+                self.pending_header_height.insert(*hash, *height);
+            }
+        }
+    }
+
     fn queue_headers_inner(&mut self, headers: Vec<Hash>, peer: Option<PeerId>) {
         const MAX_PH: usize = 50_000;
         if headers.is_empty() {
@@ -987,16 +1014,43 @@ impl ChainSync {
         }
     }
 
+    /// §9 — true when queued header `hash` lies in a later RandomX key
+    /// epoch than the block after our tip. Blocks of two epochs alternating
+    /// through the single-slot light cache cost a 0.4 s rebuild each way,
+    /// so the window waits at the boundary while the pool keeps draining.
+    fn crosses_key_epoch(&self, hash: &Hash) -> bool {
+        #[cfg(feature = "randomx")]
+        {
+            use crate::consensus::randomx_seed_for_height;
+            let next = self.local_height + 1;
+            match self.pending_header_height.get(hash) {
+                Some(&h) if h > next => randomx_seed_for_height(h) != randomx_seed_for_height(next),
+                _ => false,
+            }
+        }
+        #[cfg(not(feature = "randomx"))]
+        {
+            let _ = hash;
+            false
+        }
+    }
+
     pub fn get_blocks_to_request(&mut self, max: usize) -> Vec<Hash> {
         let mut out = Vec::new();
         let slots = self.max_concurrent.saturating_sub(self.downloading.len());
         let now = unix_now();
         while out.len() < max.min(slots) && !self.pending_headers.is_empty() {
+            // §9: hold the window at a key-epoch boundary until the tip
+            // is one block below it.
+            if matches!(self.pending_headers.front(), Some(h) if self.crosses_key_epoch(h)) {
+                break;
+            }
             if let Some(h) = self.pending_headers.pop_front() {
                 // v1.0.13 #4 — decrement per-peer counter on pop.
                 // Re-queue paths (push_front) leave attribution
                 // intact so the counter stays accurate across them.
                 self.untrack_pending_header(&h);
+                self.pending_header_height.remove(&h);
                 if !self.downloading.contains(&h) {
                     out.push(h);
                     self.downloading.insert(h);
@@ -1427,6 +1481,7 @@ impl ChainSync {
     pub fn on_block_processed(&mut self, hash: Hash, height: u64) {
         self.local_height = height;
         self.local_tip = hash;
+        self.pending_header_height.remove(&hash);
         // 2026-06-27 fix: re-derive best_known_height after local advance.
         // refresh_best_known computes max(local, max(peers)) so advancing
         // local naturally floors best_known up. Without this, an empty
@@ -4124,6 +4179,50 @@ mod tests {
         assert!(
             sync.begin_headers_request(peers[0], 1_061).is_none(),
             "headers_request_pending must gate a re-issue"
+        );
+    }
+
+    /// §9: the download window waits at a RandomX key-epoch boundary until
+    /// the tip is one block below it, so blocks of two epochs never
+    /// alternate through the single-slot light cache.
+    #[cfg(feature = "randomx")]
+    #[test]
+    fn download_window_holds_at_key_epoch_boundary() {
+        use crate::consensus::randomx_seed_for_height;
+        let boundary = (1..u64::MAX)
+            .find(|h| randomx_seed_for_height(*h) != randomx_seed_for_height(0))
+            .expect("a key-epoch boundary");
+        let tip = boundary - 3;
+        let mut sync = ChainSync::new(tip, Hash::zero());
+        let peer = super::super::peer::generate_peer_id();
+        sync.update_peer_height_for(peer, boundary + 3);
+        let hashes: Vec<Hash> = (1..=6u8).map(|i| Hash::from_bytes([i; 32])).collect();
+        let heights: Vec<(Hash, u64)> = hashes
+            .iter()
+            .enumerate()
+            .map(|(i, h)| (*h, tip + 1 + i as u64))
+            .collect();
+        sync.note_header_heights(&heights);
+        sync.queue_headers_from_peer(peer, hashes.clone());
+
+        assert_eq!(
+            sync.get_blocks_to_request(10),
+            hashes[..2].to_vec(),
+            "stops below the boundary"
+        );
+        assert!(
+            sync.get_blocks_to_request(10).is_empty(),
+            "held while the tip is behind"
+        );
+
+        sync.on_block_processed(hashes[0], boundary - 2);
+        assert!(sync.get_blocks_to_request(10).is_empty(), "still two below");
+
+        sync.on_block_processed(hashes[1], boundary - 1);
+        assert_eq!(
+            sync.get_blocks_to_request(10),
+            hashes[2..].to_vec(),
+            "released at the boundary"
         );
     }
 }

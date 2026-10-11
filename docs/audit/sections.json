@@ -9048,6 +9048,20 @@
         "adversarial": true,
         "proven": false,
         "color": "yellow"
+      },
+      {
+        "num": 9,
+        "name": "get_blocks_to_request",
+        "invariant": "the download window never runs past a RandomX key-epoch boundary until the tip is one block below it, so blocks of two epochs do not alternate through the single-slot light cache.",
+        "threat": "none adversarial; IBD crawled at 1-6 blocks/s for the last ~300 blocks of every epoch (a 0.4 s cache rebuild per flip).",
+        "tags": [],
+        "tests": [
+          "download_window_holds_at_key_epoch_boundary"
+        ],
+        "gap": false,
+        "adversarial": false,
+        "proven": false,
+        "color": "yellow"
       }
     ]
   },
