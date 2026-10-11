@@ -8038,7 +8038,7 @@
         "threat": "evicting anything other than the true oldest entry would let a flood of new orphans push out arbitrary (possibly still-relevant) entries, or regress to the prior O(n\u00b2) scan under load.",
         "tags": [],
         "tests": [
-          "mark_block_orphan_lru_evicts_at_max_orphan_blocks"
+          "mark_block_orphan_evicts_farthest_at_max_orphan_blocks"
         ],
         "gap": true,
         "adversarial": true,
@@ -8984,14 +8984,15 @@
       {
         "num": 5,
         "name": "MAX_ORPHANS_PER_PEER",
-        "invariant": "a single peer's orphan deliveries are never silently dropped by a per-peer cap; only the total-pool cap (`MAX_ORPHAN_BLOCKS`) plus LRU eviction bounds memory.",
+        "invariant": "a single peer's orphan deliveries are never silently dropped by a per-peer cap; only the total-pool cap (`MAX_ORPHAN_BLOCKS`) plus farthest-from-tip eviction bounds memory; a parent that is already pooled is never re-requested.",
         "threat": "incident F24 (2026-07-04 SEV-A) \u2014 a per-peer cap of 50 silently dropped 578 of 628 intermediate blocks during a legitimate deep reorg, so the reorg could never complete.",
         "tags": [
           "F24"
         ],
         "tests": [
           "regression_2026_07_04_deep_reorg_orphan_cap",
-          "mark_block_orphan_lru_evicts_at_max_orphan_blocks",
+          "mark_block_orphan_evicts_farthest_at_max_orphan_blocks",
+          "orphan_parent_already_pooled_is_not_requeued",
           "catch_up_stall_side_block_delivers_orphan_descendant"
         ],
         "gap": false,

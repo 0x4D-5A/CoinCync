@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use coincync::chain::{Blockchain, ChainLoadOutcome};
 use coincync::config::Network;
@@ -1597,7 +1597,7 @@ async fn start_node(
                             // the 2026-06-17 root-cause notes on why the hashes-only
                             // version stuck the chain at h=167 with 200 blocks of
                             // orphan-fetch loops.
-                            warn!(
+                            debug!(
                                 "Block {} from peer {:?} orphan; fetching parent {}",
                                 hex::encode(&hash.as_bytes()[..8]),
                                 &peer_id[..4],
