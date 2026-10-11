@@ -169,6 +169,10 @@ struct PeerMessage {
     peer_id: PeerId,
     msg_type: u8,
     payload: Vec<u8>,
+    /// When the frame came off the socket. The processor can be seconds
+    /// behind during IBD, so anything timing a reply (Pong) must use this,
+    /// not the moment the handler runs.
+    received_at: crate::clock::MonoInstant,
     _reservation: MemoryReservation,
 }
 

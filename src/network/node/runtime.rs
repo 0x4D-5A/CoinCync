@@ -385,6 +385,7 @@ pub(super) fn spawn_message_processor(
                         msg.peer_id,
                         msg.msg_type,
                         &msg.payload,
+                        msg.received_at,
                         magic,
                         processor_nonce,
                         &processor_peers,
@@ -525,6 +526,7 @@ mod runtime_tests {
                 peer_id,
                 msg_type: 200,
                 payload: vec![],
+                received_at: crate::clock::mono_now(),
                 _reservation: Arc::new(
                     crate::network::connection_tracker::ConnectionTracker::new(1024),
                 )
@@ -539,6 +541,7 @@ mod runtime_tests {
                 peer_id,
                 msg_type: MessageType::Version as u8,
                 payload: vec![0u8; 1025],
+                received_at: crate::clock::mono_now(),
                 _reservation: Arc::new(
                     crate::network::connection_tracker::ConnectionTracker::new(1024),
                 )

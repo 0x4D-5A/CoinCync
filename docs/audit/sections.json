@@ -6727,15 +6727,16 @@
       {
         "num": 6,
         "name": "handle_ping",
-        "invariant": "a malformed (<8-byte) Ping scores ProtocolViolation and never elicits a Pong; a well-formed Ping echoes its nonce exactly; Pong itself is a no-op.",
-        "threat": "P5-N5 malformed-ping spam evading misbehavior scoring.",
+        "invariant": "a malformed (<8-byte) Ping or Pong scores ProtocolViolation and a malformed Ping never elicits a Pong; a well-formed Ping echoes its nonce exactly; a Pong is matched against the nonce we sent that peer and only then recorded as its latency sample.",
+        "threat": "P5-N5 malformed-ping spam evading misbehavior scoring; forged or replayed Pongs steering the latency score.",
         "tags": [
           "P5-N5"
         ],
         "tests": [
           "handle_ping_malformed_scores_and_sends_no_pong",
           "handle_ping_echoes_nonce_as_pong",
-          "handle_pong_is_a_noop"
+          "handle_pong_records_rtt_for_our_nonce",
+          "handle_pong_ignores_unknown_nonce_and_scores_malformed"
         ],
         "gap": false,
         "adversarial": true,
@@ -8699,6 +8700,22 @@
           "top_peers_for_download_filters_unvalidated_and_low_score",
           "peers_by_latency_filters_unvalidated_and_orders_ascending",
           "test_peer_scorer"
+        ],
+        "gap": false,
+        "adversarial": true,
+        "proven": false,
+        "color": "yellow"
+      },
+      {
+        "num": 11,
+        "name": "record_pong",
+        "invariant": "`latency_ms` only moves on a Pong whose nonce matches the Ping recorded for that peer; the first sample replaces the 1000 ms placeholder, later ones are averaged; a nonce is single use.",
+        "threat": "a peer forging or replaying Pongs to lower its latency term (25% of composite_score) and win header-request selection.",
+        "tags": [],
+        "tests": [
+          "pong_with_matching_nonce_measures_latency",
+          "pong_with_wrong_nonce_is_ignored",
+          "latency_averages_after_the_first_sample"
         ],
         "gap": false,
         "adversarial": true,
