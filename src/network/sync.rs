@@ -45,12 +45,15 @@
 //! - **§5 orphan admission (`MAX_ORPHANS_PER_PEER`, `on_block_received_from`,
 //!   `mark_block_orphan`)** — INVARIANT: a single peer's orphan deliveries
 //!   are never silently dropped by a per-peer cap; only the total-pool cap
-//!   (`MAX_ORPHAN_BLOCKS`) plus LRU eviction bounds memory.
+//!   (`MAX_ORPHAN_BLOCKS`) plus farthest-from-tip eviction bounds memory; a
+//!   parent that is already pooled is never re-requested (its own orphan
+//!   report queued what is actually missing).
 //!   THREAT: incident F24 (2026-07-04 SEV-A) — a per-peer cap of 50 silently
 //!   dropped 578 of 628 intermediate blocks during a legitimate deep reorg,
 //!   so the reorg could never complete.
 //!   TESTS: `regression_2026_07_04_deep_reorg_orphan_cap`,
-//!   `mark_block_orphan_lru_evicts_at_max_orphan_blocks`,
+//!   `mark_block_orphan_evicts_farthest_at_max_orphan_blocks`,
+//!   `orphan_parent_already_pooled_is_not_requeued`,
 //!   `catch_up_stall_side_block_delivers_orphan_descendant`.
 //! - **§6 `mark_block_failed` / stuck-download detection (`is_stalled`,
 //!   `get_blocks_to_retry`)** — INVARIANT: a block sitting in `downloading`
@@ -80,6 +83,14 @@
 //!   `header_nonce_rejected_after_generation_reset`,
 //!   `header_nonce_cancelled_send_allows_immediate_retry`,
 //!   `header_nonce_unsolicited_rejected`.
+//! - **§9 `get_blocks_to_request` key-epoch hold (`note_header_heights`,
+//!   `crosses_key_epoch`)** — INVARIANT: the download window never runs
+//!   past a RandomX key-epoch boundary until the tip is one block below
+//!   it, so blocks of two epochs do not alternate through the single-slot
+//!   light cache (a 0.4 s rebuild per flip; IBD crawled at 1-6 blocks/s
+//!   for the last ~300 blocks of every epoch).
+//!   THREAT: none adversarial; IBD throughput.
+//!   TESTS: `download_window_holds_at_key_epoch_boundary`.
 
 use crate::consensus::Block;
 use crate::error::Result;
@@ -138,8 +149,8 @@ const ORPHAN_CLEANUP_INTERVAL: u64 = 60;
 ///
 /// **Why the pre-audit value was 50**: appears to be a DoS heuristic
 /// intended to prevent one peer from filling the entire pool. BUT the
-/// TOTAL pool cap (`MAX_ORPHAN_BLOCKS = 1000` + LRU-oldest eviction at
-/// `on_block_received_from` line ~547) already provides that
+/// TOTAL pool cap (`MAX_ORPHAN_BLOCKS = 1000` + farthest-from-tip eviction
+/// in `make_room_for_orphan`) already provides that
 /// protection. The per-peer cap was defense-in-depth that BOTH:
 ///   * failed to prevent DoS (LRU already does that better)
 ///   * created a new attack surface (silent-drop → chain-stall)
@@ -147,7 +158,7 @@ const ORPHAN_CLEANUP_INTERVAL: u64 = 60;
 /// **Post-fix value**: `usize::MAX` — effectively unbounded per-peer.
 /// The check `orphans_per_peer[p] >= MAX_ORPHANS_PER_PEER` becomes
 /// impossible to trigger, so orphans are accepted up to the total-pool
-/// cap and evicted by LRU as designed.
+/// cap and evicted farthest-from-tip first.
 ///
 /// The `orphans_per_peer` counter itself is retained (unchanged in
 /// this fix — see `on_block_received_from` and the resolution-decrement
@@ -226,6 +237,10 @@ pub struct ChainSync {
     /// MAX_HEADERS_PER_PEER. Kept in sync with `pending_header_peer`
     /// — invariant: count == pending_header_peer values matching this peer.
     headers_per_peer: HashMap<PeerId, usize>,
+    /// §9 — heights of queued headers, so `get_blocks_to_request` can
+    /// hold the window at a RandomX key-epoch boundary. Filled by
+    /// `note_header_heights`; an entry leaves with its pop or its commit.
+    pending_header_height: HashMap<Hash, u64>,
     downloading: HashSet<Hash>,
     download_timestamps: HashMap<Hash, DownloadEntry>,
     /// Monotonic counter stamped on every hash as it leaves `pending_headers`.
@@ -361,6 +376,7 @@ impl ChainSync {
             pending_headers: VecDeque::new(),
             pending_header_peer: HashMap::new(),
             headers_per_peer: HashMap::new(),
+            pending_header_height: HashMap::new(),
             downloading: HashSet::new(),
             download_timestamps: HashMap::new(),
             next_request_seq: 0,
@@ -399,6 +415,10 @@ impl ChainSync {
         self.last_orphan_cleanup = current_time;
 
         let cutoff = current_time.saturating_sub(ORPHAN_TTL_SECONDS);
+        // §9: heights are only needed above the tip.
+        let tip = self.local_height;
+        self.pending_header_height.retain(|_, h| *h > tip);
+
         let expired: Vec<(Hash, Hash)> = self
             .orphan_blocks
             .iter()
@@ -913,6 +933,16 @@ impl ChainSync {
         self.queue_headers_inner(headers, Some(peer));
     }
 
+    /// §9 — remember the heights of validated headers before queueing
+    /// them. Heights at or below the tip are not needed.
+    pub fn note_header_heights(&mut self, heights: &[(Hash, u64)]) {
+        for (hash, height) in heights {
+            if *height > self.local_height {
+                self.pending_header_height.insert(*hash, *height);
+            }
+        }
+    }
+
     fn queue_headers_inner(&mut self, headers: Vec<Hash>, peer: Option<PeerId>) {
         const MAX_PH: usize = 50_000;
         if headers.is_empty() {
@@ -984,16 +1014,43 @@ impl ChainSync {
         }
     }
 
+    /// §9 — true when queued header `hash` lies in a later RandomX key
+    /// epoch than the block after our tip. Blocks of two epochs alternating
+    /// through the single-slot light cache cost a 0.4 s rebuild each way,
+    /// so the window waits at the boundary while the pool keeps draining.
+    fn crosses_key_epoch(&self, hash: &Hash) -> bool {
+        #[cfg(feature = "randomx")]
+        {
+            use crate::consensus::randomx_seed_for_height;
+            let next = self.local_height + 1;
+            match self.pending_header_height.get(hash) {
+                Some(&h) if h > next => randomx_seed_for_height(h) != randomx_seed_for_height(next),
+                _ => false,
+            }
+        }
+        #[cfg(not(feature = "randomx"))]
+        {
+            let _ = hash;
+            false
+        }
+    }
+
     pub fn get_blocks_to_request(&mut self, max: usize) -> Vec<Hash> {
         let mut out = Vec::new();
         let slots = self.max_concurrent.saturating_sub(self.downloading.len());
         let now = unix_now();
         while out.len() < max.min(slots) && !self.pending_headers.is_empty() {
+            // §9: hold the window at a key-epoch boundary until the tip
+            // is one block below it.
+            if matches!(self.pending_headers.front(), Some(h) if self.crosses_key_epoch(h)) {
+                break;
+            }
             if let Some(h) = self.pending_headers.pop_front() {
                 // v1.0.13 #4 — decrement per-peer counter on pop.
                 // Re-queue paths (push_front) leave attribution
                 // intact so the counter stays accurate across them.
                 self.untrack_pending_header(&h);
+                self.pending_header_height.remove(&h);
                 if !self.downloading.contains(&h) {
                     out.push(h);
                     self.downloading.insert(h);
@@ -1190,25 +1247,8 @@ impl ChainSync {
             return Ok(out);
         }
 
-        while self.orphan_blocks.len() >= MAX_ORPHAN_BLOCKS {
-            if let Some(k) = self
-                .orphan_blocks
-                .iter()
-                .min_by_key(|(_, e)| e.received_at)
-                .map(|(k, _)| *k)
-            {
-                if let Some(o) = self.orphan_blocks.remove(&k) {
-                    let p = o.block.header.prev_hash;
-                    if let Some(c) = self.orphan_by_parent.get_mut(&p) {
-                        c.retain(|h| h != &k);
-                        if c.is_empty() {
-                            self.orphan_by_parent.remove(&p);
-                        }
-                    }
-                }
-            } else {
-                break;
-            }
+        if !self.make_room_for_orphan(height) {
+            return Ok(vec![]);
         }
         if let Some(pid) = from {
             let c = self.orphans_per_peer.entry(pid).or_insert(0);
@@ -1229,6 +1269,37 @@ impl ChainSync {
             },
         );
         Ok(vec![])
+    }
+
+    /// Make room for an orphan at `height`: while the pool is full, drop the
+    /// block farthest from the tip, and refuse the newcomer if it is farther
+    /// than everything held. Blocks right behind the gap are the ones that
+    /// connect next; evicting by arrival time threw exactly those away during
+    /// multi-peer IBD and had them downloaded again.
+    fn make_room_for_orphan(&mut self, height: u64) -> bool {
+        while self.orphan_blocks.len() >= MAX_ORPHAN_BLOCKS {
+            let farthest = self
+                .orphan_blocks
+                .iter()
+                .max_by_key(|(_, e)| e.block.header.height)
+                .map(|(k, e)| (*k, e.block.header.height));
+            match farthest {
+                Some((_, h)) if height >= h.as_u64() => return false,
+                Some((k, _)) => {
+                    if let Some(o) = self.orphan_blocks.remove(&k) {
+                        let p = o.block.header.prev_hash;
+                        if let Some(c) = self.orphan_by_parent.get_mut(&p) {
+                            c.retain(|h| h != &k);
+                            if c.is_empty() {
+                                self.orphan_by_parent.remove(&p);
+                            }
+                        }
+                    }
+                }
+                None => break,
+            }
+        }
+        true
     }
 
     /// Drain and return the orphan blocks whose `prev_hash == parent_hash`,
@@ -1317,8 +1388,9 @@ impl ChainSync {
     /// chain forward via on_block_received_from's drain loop, each
     /// pooled orphan is replayed in order. No second gossip required.
     ///
-    /// Eviction is LRU by `received_at`, capped at `MAX_ORPHAN_BLOCKS` —
-    /// same policy as the IBD-path orphan storage. Per-peer caps via
+    /// Eviction drops the block farthest from the tip first and refuses a
+    /// newcomer farther than everything held (`make_room_for_orphan`), capped
+    /// at `MAX_ORPHAN_BLOCKS` — same policy as the IBD-path orphan storage. Per-peer caps via
     /// `MAX_ORPHANS_PER_PEER` prevent a single misbehaving peer from
     /// filling the pool with garbage.
     pub fn mark_block_orphan(&mut self, block: Block, from: Option<PeerId>, parent_hash: &Hash) {
@@ -1331,33 +1403,15 @@ impl ChainSync {
 
         // Store the orphan body so the on_block_received_from drain
         // loop can replay it once the parent connects. Same storage
-        // policy as the IBD-path orphan code (eviction by oldest
-        // received_at, per-peer cap, parent index).
+        // policy as the IBD-path orphan code (farthest-from-tip eviction,
+        // per-peer cap, parent index).
         let now = unix_now();
         if !self.orphan_blocks.contains_key(&orphan_hash) {
-            // Evict oldest if pool is full.
-            while self.orphan_blocks.len() >= MAX_ORPHAN_BLOCKS {
-                if let Some(k) = self
-                    .orphan_blocks
-                    .iter()
-                    .min_by_key(|(_, e)| e.received_at)
-                    .map(|(k, _)| *k)
-                {
-                    if let Some(o) = self.orphan_blocks.remove(&k) {
-                        let p = o.block.header.prev_hash;
-                        if let Some(c) = self.orphan_by_parent.get_mut(&p) {
-                            c.retain(|h| h != &k);
-                            if c.is_empty() {
-                                self.orphan_by_parent.remove(&p);
-                            }
-                        }
-                    }
-                } else {
-                    break;
-                }
-            }
+            let room = self.make_room_for_orphan(block.header.height.as_u64());
             // Per-peer cap to bound flood damage.
-            let admit = if let Some(pid) = from {
+            let admit = if !room {
+                false
+            } else if let Some(pid) = from {
                 let c = self.orphans_per_peer.entry(pid).or_insert(0);
                 if *c >= MAX_ORPHANS_PER_PEER {
                     false
@@ -1395,6 +1449,15 @@ impl ChainSync {
         if self.pending_headers.contains(parent_hash) {
             return;
         }
+        // The parent is itself an orphan we already hold: its own parent is
+        // what the chain is missing, and that request is already queued (or
+        // about to be, by its own orphan notification). Re-requesting a pooled
+        // block only produces another orphan report for it. On a single-peer
+        // IBD this turned every 100-block response into 100 re-requests and the
+        // tip advanced by one block per round trip.
+        if self.orphan_blocks.contains_key(parent_hash) {
+            return;
+        }
 
         // Front-queue with high priority — the orphan is gated on this parent.
         const MAX_PH: usize = 50_000;
@@ -1418,6 +1481,7 @@ impl ChainSync {
     pub fn on_block_processed(&mut self, hash: Hash, height: u64) {
         self.local_height = height;
         self.local_tip = hash;
+        self.pending_header_height.remove(&hash);
         // 2026-06-27 fix: re-derive best_known_height after local advance.
         // refresh_best_known computes max(local, max(peers)) so advancing
         // local naturally floors best_known up. Without this, an empty
@@ -2226,7 +2290,7 @@ mod tests {
     /// remaining 578 silently dropped, reorg never completed.
     ///
     /// Post-fix `MAX_ORPHANS_PER_PEER = usize::MAX` — no per-peer cap.
-    /// Total-pool cap (`MAX_ORPHAN_BLOCKS = 1000`) + LRU eviction + TTL
+    /// Total-pool cap (`MAX_ORPHAN_BLOCKS = 1000`) + farthest-from-tip eviction + TTL
     /// still provide DoS protection.
     ///
     /// This test simulates a peer submitting far more than 50 orphans and
@@ -3857,11 +3921,11 @@ mod tests {
         );
     }
 
-    /// Orphan-flood memory bound: `mark_block_orphan` LRU-evicts so the orphan
+    /// Orphan-flood memory bound: `mark_block_orphan` evicts farthest-first so the orphan
     /// pool never exceeds `MAX_ORPHAN_BLOCKS`, regardless of how many a peer
     /// pushes. (mark_block_orphan does not PoW-gate, so no mining is needed.)
     #[test]
-    fn mark_block_orphan_lru_evicts_at_max_orphan_blocks() {
+    fn mark_block_orphan_evicts_farthest_at_max_orphan_blocks() {
         use crate::consensus::BlockHeader;
         use crate::primitives::PublicKey;
 
@@ -3906,16 +3970,93 @@ mod tests {
             "pool fills exactly to the cap"
         );
 
-        // Pushing more must evict oldest, keeping the pool bounded.
+        // Blocks farther out than everything pooled are refused; the pool
+        // keeps the blocks nearest the tip, which are the ones a closing gap
+        // needs first.
         for i in 0..50u64 {
             sync.mark_block_orphan(make(1_000_000 + i, 1_000_000 + i), None, &local_tip);
         }
         assert_eq!(
             sync.orphan_blocks.len(),
             MAX_ORPHAN_BLOCKS,
-            "orphan pool stays bounded at MAX_ORPHAN_BLOCKS via LRU eviction \
-             no matter how many orphans arrive"
+            "orphan pool stays bounded at MAX_ORPHAN_BLOCKS no matter how many \
+             orphans arrive"
         );
+        assert!(
+            sync.orphan_blocks.contains_key(&make(1, 0).hash()),
+            "the block nearest the tip survives"
+        );
+        assert!(
+            !sync
+                .orphan_blocks
+                .contains_key(&make(1_000_000, 1_000_000).hash()),
+            "a block farther than everything pooled is not admitted"
+        );
+
+        // A nearer block evicts the farthest pooled one instead.
+        let nearer = make(0, 7);
+        sync.mark_block_orphan(nearer.clone(), None, &local_tip);
+        assert!(sync.orphan_blocks.contains_key(&nearer.hash()));
+        assert!(
+            !sync
+                .orphan_blocks
+                .contains_key(&make(MAX_ORPHAN_BLOCKS as u64, MAX_ORPHAN_BLOCKS as u64 - 1).hash()),
+            "the farthest pooled block made room"
+        );
+        assert_eq!(sync.orphan_blocks.len(), MAX_ORPHAN_BLOCKS);
+    }
+
+    #[test]
+    fn orphan_parent_already_pooled_is_not_requeued() {
+        use crate::consensus::BlockHeader;
+        use crate::primitives::PublicKey;
+
+        let make = |height: u64, prev_hash: Hash| -> Block {
+            Block {
+                header: BlockHeader {
+                    network_magic: crate::config::NetworkType::Testnet.magic_bytes(),
+                    version: 1,
+                    height: crate::primitives::Height::new(height),
+                    timestamp: crate::primitives::Timestamp::from_secs(1_000 + height),
+                    prev_hash,
+                    tx_root: Hash::zero(),
+                    anchor: Hash::zero(),
+                    algorithm: 0,
+                    nonce: height,
+                    target: Hash::from_bytes([0xFF; 32]),
+                    miner_pubkey: PublicKey::from_bytes([0u8; 32]),
+                    supply_commitment: [0u8; 32],
+                    checkpoint_vote: None,
+                    spark_set_root: [0u8; 32],
+                    mw_kernel_root: [0u8; 32],
+                },
+                transactions: vec![],
+            }
+        };
+
+        let mut sync = ChainSync::new(0, Hash::zero());
+        let missing = Hash::from_bytes([0xAB; 32]);
+        let a = make(5, missing);
+        let b = make(6, a.hash());
+        let c = make(7, b.hash());
+
+        sync.mark_block_orphan(a.clone(), None, &missing);
+        assert_eq!(
+            sync.pending_headers.front(),
+            Some(&missing),
+            "the first orphan front-queues the block the chain is missing"
+        );
+
+        sync.mark_block_orphan(b.clone(), None, &a.hash());
+        sync.mark_block_orphan(c, None, &b.hash());
+        assert_eq!(sync.orphan_blocks.len(), 3);
+        assert_eq!(
+            sync.pending_headers.len(),
+            1,
+            "parents that are pooled orphans themselves are not requested again"
+        );
+        assert!(!sync.pending_headers.contains(&a.hash()));
+        assert!(!sync.pending_headers.contains(&b.hash()));
     }
 
     /// `trigger_resync` fires ONLY from `Synced`/`Idle` (moving to `Headers`);
@@ -4038,6 +4179,50 @@ mod tests {
         assert!(
             sync.begin_headers_request(peers[0], 1_061).is_none(),
             "headers_request_pending must gate a re-issue"
+        );
+    }
+
+    /// §9: the download window waits at a RandomX key-epoch boundary until
+    /// the tip is one block below it, so blocks of two epochs never
+    /// alternate through the single-slot light cache.
+    #[cfg(feature = "randomx")]
+    #[test]
+    fn download_window_holds_at_key_epoch_boundary() {
+        use crate::consensus::randomx_seed_for_height;
+        let boundary = (1..u64::MAX)
+            .find(|h| randomx_seed_for_height(*h) != randomx_seed_for_height(0))
+            .expect("a key-epoch boundary");
+        let tip = boundary - 3;
+        let mut sync = ChainSync::new(tip, Hash::zero());
+        let peer = super::super::peer::generate_peer_id();
+        sync.update_peer_height_for(peer, boundary + 3);
+        let hashes: Vec<Hash> = (1..=6u8).map(|i| Hash::from_bytes([i; 32])).collect();
+        let heights: Vec<(Hash, u64)> = hashes
+            .iter()
+            .enumerate()
+            .map(|(i, h)| (*h, tip + 1 + i as u64))
+            .collect();
+        sync.note_header_heights(&heights);
+        sync.queue_headers_from_peer(peer, hashes.clone());
+
+        assert_eq!(
+            sync.get_blocks_to_request(10),
+            hashes[..2].to_vec(),
+            "stops below the boundary"
+        );
+        assert!(
+            sync.get_blocks_to_request(10).is_empty(),
+            "held while the tip is behind"
+        );
+
+        sync.on_block_processed(hashes[0], boundary - 2);
+        assert!(sync.get_blocks_to_request(10).is_empty(), "still two below");
+
+        sync.on_block_processed(hashes[1], boundary - 1);
+        assert_eq!(
+            sync.get_blocks_to_request(10),
+            hashes[2..].to_vec(),
+            "released at the boundary"
         );
     }
 }

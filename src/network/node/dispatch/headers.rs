@@ -691,6 +691,12 @@ pub(super) async fn handle_headers(
                 max_header_height,
                 &peer_id[..4]
             );
+            let heights: Vec<(Hash, u64)> = hashes
+                .iter()
+                .zip(&headers_msg.headers)
+                .map(|(hash, header)| (*hash, header.height.as_u64()))
+                .collect();
+            sync_guard.note_header_heights(&heights);
             sync_guard.queue_headers_from_peer(peer_id, hashes);
         }
         Err(e) => {
