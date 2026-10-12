@@ -72,10 +72,16 @@
 //!   returns `false` instead of submitting garbage. THREAT: a spurious/empty
 //!   submission, or a mined block that never reaches peers. TESTS:
 //!   `submit_and_broadcast_without_candidate_returns_false`, `stratum_submit_produces_block`.
-//! - **§9 `share_tally` / `spawn_job_updater`** — INVARIANT: `share_tally` weights
-//!   valid shares per login and skips empty logins; the job updater rotates jobs on
-//!   tip change. THREAT: mis-weighted payout accounting. TESTS:
-//!   `share_tally_weights_valid_shares_per_login_skips_empty`.
+//! - **§9 `share_tally` / `credit_share` / `load_tally` / `persist_tally` /
+//!   `spawn_job_updater`** — INVARIANT: `share_tally` weights valid shares per
+//!   login and skips empty logins; the tally is kept on `StratumStats`, not on
+//!   the connection, and the job updater writes it to the tally file whenever
+//!   it moved, so a disconnect or a restart loses no credit; the job updater
+//!   rotates jobs on tip change. THREAT: mis-weighted payout accounting, or
+//!   credit lost with a dropped connection. TESTS:
+//!   `share_tally_weights_valid_shares_per_login_skips_empty`,
+//!   `share_tally_survives_disconnect_and_reload`,
+//!   `test_load_tally_corrupt_json_is_safe_empty`.
 //! - **§10 coinbase / merkle helpers (`create_coinbase_prefix` / `create_coinbase_suffix`
 //!   / `compute_merkle_branches` / `difficulty_to_nbits` / `format_mining_notify`)** —
 //!   INVARIANT: the coinbase prefix/suffix layout and merkle branches match the
@@ -481,6 +487,10 @@ pub struct StratumStats {
     /// whether the chain accepted them.
     pub block_pow_hits: u64,
     pub hashrate: f64,
+    /// Difficulty-weighted valid shares per miner `login` (native protocol).
+    /// Kept here rather than on the connection so a miner's credit survives
+    /// its disconnect; written to the tally file by the job updater. See §9.
+    pub share_tally: HashMap<String, u128>,
 }
 
 /// Stratum server
@@ -505,6 +515,9 @@ pub struct StratumServer {
     running: Arc<std::sync::atomic::AtomicBool>,
     bans: Arc<RwLock<HashMap<String, PersistedBanEntry>>>,
     banlist_path: Option<PathBuf>,
+    /// Where the per-login share tally is written (`COINCYNC_STRATUM_TALLY_PATH`,
+    /// default `stratum_shares.json`); see §9.
+    tally_path: Option<PathBuf>,
     /// Optional P2P handle so a pool-found block is broadcast to peers. Without
     /// it, an accepted block stays local — fine for an isolated regtest node,
     /// but on a real network the pool would fork away from its peers.
@@ -522,6 +535,13 @@ impl StratumServer {
             .map(PathBuf::from)
             .or_else(|| Some(PathBuf::from("stratum_bans.json")));
         let bans = banlist_path.as_ref().map(load_banlist).unwrap_or_default();
+        let tally_path = std::env::var("COINCYNC_STRATUM_TALLY_PATH")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| Some(PathBuf::from("stratum_shares.json")));
+        let share_tally = tally_path.as_deref().map(load_tally).unwrap_or_default();
 
         StratumServer {
             config,
@@ -535,11 +555,15 @@ impl StratumServer {
             nonce_dedup: Arc::new(RwLock::new(JobNonceLedger::default())),
             candidates: Arc::new(RwLock::new(HashMap::new())),
             job_broadcast,
-            stats: Arc::new(RwLock::new(StratumStats::default())),
+            stats: Arc::new(RwLock::new(StratumStats {
+                share_tally,
+                ..StratumStats::default()
+            })),
             running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             p2p: None,
             bans: Arc::new(RwLock::new(bans)),
             banlist_path,
+            tally_path,
         }
     }
 
@@ -629,21 +653,16 @@ impl StratumServer {
     }
 
     /// Per-login share tally for a PUBLIC-pool operator: each miner's valid
-    /// shares weighted by their share difficulty, keyed by their `login`
-    /// (conventionally `<miner_address>.<worker>`). This is the input to a
-    /// payout scheme — the operator distributes the coinbase (which pays the
-    /// pool's own `--stratum-address`) to miners in proportion to these
-    /// weighted shares. Solo/self-hosted operators can ignore it.
+    /// shares weighted by the share difficulty at the time, keyed by their
+    /// `login` (conventionally `<miner_address>.<worker>`). This is the input
+    /// to a payout scheme — the operator distributes the coinbase (which pays
+    /// the pool's own `--stratum-address`) to miners in proportion to these
+    /// weighted shares. The tally lives on [`StratumStats`], not on the
+    /// connection, so it survives a miner's disconnect, and the job updater
+    /// writes it to the tally file so it survives a restart. Solo/self-hosted
+    /// operators can ignore it.
     pub async fn share_tally(&self) -> HashMap<String, u128> {
-        let mut out: HashMap<String, u128> = HashMap::new();
-        for w in self.workers.read().await.values() {
-            if w.payout_login.is_empty() {
-                continue;
-            }
-            *out.entry(w.payout_login.clone()).or_insert(0) +=
-                (w.valid_shares as u128).saturating_mul(w.difficulty.max(1) as u128);
-        }
-        out
+        self.stats.read().await.share_tally.clone()
     }
 
     /// Spawn job update task
@@ -658,9 +677,12 @@ impl StratumServer {
         let share_difficulty = self.config.share_difficulty;
         let payout_spend = self.config.payout_spend_public;
         let payout_view = self.config.payout_view_public;
+        let stats = self.stats.clone();
+        let tally_path = self.tally_path.clone();
 
         tokio::spawn(async move {
             let mut last_tip = Hash::zero();
+            let mut persisted_valid_shares = stats.read().await.valid_shares;
 
             while running.load(Ordering::SeqCst) {
                 let tip = chain.tip_hash();
@@ -749,6 +771,20 @@ impl StratumServer {
                         job_height,
                         payout_spend.is_some()
                     );
+                }
+
+                // Write the share tally when it moved: at most one file write
+                // per second, outside the stats lock.
+                if let Some(path) = tally_path.as_ref() {
+                    let snapshot = {
+                        let s = stats.read().await;
+                        (s.valid_shares != persisted_valid_shares)
+                            .then(|| (s.valid_shares, s.share_tally.clone()))
+                    };
+                    if let Some((valid, tally)) = snapshot {
+                        persisted_valid_shares = valid;
+                        persist_tally(path, &tally);
+                    }
                 }
 
                 tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
@@ -1268,13 +1304,17 @@ async fn handle_stratum_message(
             }
             {
                 let mut wr = workers.write().await;
-                if let Some(w) = wr.get_mut(&worker_id) {
+                let credit = wr.get_mut(&worker_id).map(|w| {
                     w.valid_shares += 1;
                     w.invalid_breaker.record_success();
-                }
+                    (w.payout_login.clone(), w.difficulty)
+                });
                 let mut s = stats.write().await;
                 s.total_shares += 1;
                 s.valid_shares += 1;
+                if let Some((login, difficulty)) = credit {
+                    credit_share(&mut s.share_tally, &login, difficulty);
+                }
             }
             if pow.meets_difficulty(&job.target) {
                 // A PoW solution is a "hit"; whether it becomes a chain-accepted
@@ -1770,6 +1810,42 @@ fn persist_banlist(path: &PathBuf, bans: &HashMap<String, PersistedBanEntry>) {
         if let Err(e) = std::fs::write(path, raw) {
             warn!(
                 "Failed to persist Stratum banlist {}: {}",
+                path.display(),
+                e
+            );
+        }
+    }
+}
+
+/// Credit one valid share to `login` at the worker's share difficulty. Empty
+/// logins (the legacy `mining.*` protocol has none) are not tallied.
+fn credit_share(tally: &mut HashMap<String, u128>, login: &str, difficulty: u64) {
+    if login.is_empty() {
+        return;
+    }
+    let entry = tally.entry(login.to_string()).or_insert(0);
+    *entry = entry.saturating_add(u128::from(difficulty.max(1)));
+}
+
+fn load_tally(path: &std::path::Path) -> HashMap<String, u128> {
+    match std::fs::read_to_string(path) {
+        Ok(raw) => serde_json::from_str::<HashMap<String, u128>>(&raw).unwrap_or_else(|e| {
+            warn!(
+                "Failed to parse Stratum share tally {}: {}",
+                path.display(),
+                e
+            );
+            HashMap::new()
+        }),
+        Err(_) => HashMap::new(),
+    }
+}
+
+fn persist_tally(path: &std::path::Path, tally: &HashMap<String, u128>) {
+    if let Ok(raw) = serde_json::to_string_pretty(tally) {
+        if let Err(e) = std::fs::write(path, raw) {
+            warn!(
+                "Failed to persist Stratum share tally {}: {}",
                 path.display(),
                 e
             );
@@ -2291,6 +2367,11 @@ mod tests {
         assert!(resp2.contains("\"status\":\"OK\""), "submit OK: {resp2}");
         assert_eq!(chain.height(), 1, "native submit produced a block; tip advanced");
         assert_eq!(stats.read().await.blocks_found, 1, "one block found");
+        assert_eq!(
+            stats.read().await.share_tally.get("pool.w").copied(),
+            Some(1000),
+            "the valid share is credited to the login at the share difficulty"
+        );
     }
 
     // ── Share-replay defense: server-owned per-canonical-job nonce ledger ──
@@ -2881,31 +2962,72 @@ mod tests {
         let server = StratumServer::new(StratumConfig::default(), chain, mempool);
 
         {
-            let mut w = server.workers.write().await;
-            let mut a = mk_worker(true, vec![0, 0, 0, 0]);
-            a.payout_login = "miner.a".to_string();
-            a.valid_shares = 2;
-            a.difficulty = 1000;
-            w.insert(1, a);
-
-            // Second worker on the same login (weights accumulate).
-            let mut a2 = mk_worker(true, vec![0, 0, 0, 0]);
-            a2.payout_login = "miner.a".to_string();
-            a2.valid_shares = 1;
-            a2.difficulty = 500;
-            w.insert(2, a2);
-
-            // Empty payout login → skipped entirely.
-            let mut anon = mk_worker(true, vec![0, 0, 0, 0]);
-            anon.payout_login = String::new();
-            anon.valid_shares = 99;
-            anon.difficulty = 9999;
-            w.insert(3, anon);
+            let mut s = server.stats.write().await;
+            // Two shares at difficulty 1000 from one connection ...
+            credit_share(&mut s.share_tally, "miner.a", 1000);
+            credit_share(&mut s.share_tally, "miner.a", 1000);
+            // ... and one at 500 from a second connection on the same login
+            // (weights accumulate).
+            credit_share(&mut s.share_tally, "miner.a", 500);
+            // Empty payout login -> skipped entirely.
+            credit_share(&mut s.share_tally, "", 9999);
         }
 
         let tally = server.share_tally().await;
         assert_eq!(tally.len(), 1, "only the non-empty login is present");
-        assert_eq!(tally.get("miner.a").copied(), Some(2 * 1000 + 1 * 500));
+        assert_eq!(tally.get("miner.a").copied(), Some(2 * 1000 + 500));
+    }
+
+    /// The credit is not derived from live connections: removing every worker
+    /// leaves the tally intact, and a persisted tally reloads equal, including
+    /// a value past u64::MAX.
+    #[tokio::test]
+    async fn share_tally_survives_disconnect_and_reload() {
+        let chain = Arc::new(crate::chain::Blockchain::new());
+        let mempool = crate::mempool::SharedMempool::new();
+        let server = StratumServer::new(StratumConfig::default(), chain, mempool);
+        {
+            let mut w = server.workers.write().await;
+            let mut a = mk_worker(true, vec![0, 0, 0, 0]);
+            a.payout_login = "miner.a".to_string();
+            w.insert(1, a);
+        }
+        {
+            let mut s = server.stats.write().await;
+            credit_share(&mut s.share_tally, "miner.a", 1000);
+        }
+        server.workers.write().await.remove(&1);
+        assert_eq!(
+            server.share_tally().await.get("miner.a").copied(),
+            Some(1000)
+        );
+
+        let uniq = format!(
+            "coincync-stratum-shares-rt-{}-{}.json",
+            std::process::id(),
+            timestamp_now_ms()
+        );
+        let path = std::env::temp_dir().join(uniq);
+        let mut tally = server.share_tally().await;
+        tally.insert("miner.big".to_string(), u128::from(u64::MAX) + 1);
+        persist_tally(&path, &tally);
+        let loaded = load_tally(&path);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(loaded, tally);
+    }
+
+    #[test]
+    fn test_load_tally_corrupt_json_is_safe_empty() {
+        let uniq = format!(
+            "coincync-stratum-shares-bad-{}-{}.json",
+            std::process::id(),
+            timestamp_now_ms()
+        );
+        let path = std::env::temp_dir().join(uniq);
+        std::fs::write(&path, b"{not-json").expect("write");
+        let tally = load_tally(&path);
+        let _ = std::fs::remove_file(path);
+        assert!(tally.is_empty());
     }
 
     /// Share::verify classifies a share as Valid / Block / Invalid purely by

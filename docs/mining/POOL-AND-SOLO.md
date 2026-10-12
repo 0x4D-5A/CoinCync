@@ -77,7 +77,7 @@ coincync-node --network mainnet --stratum 0.0.0.0:3333 --stratum-address <POOL_A
 | CoinCync-native `login`/`job`/`submit`/`keepalived` protocol | ✅ done |
 | Fork-safe, mempool-synced submission | ✅ done |
 | Pool-wide **share difficulty** (job carries a share target below the block target) | ✅ done (`share_difficulty`, default 1000) |
-| Per-miner **share accounting** for reward-splitting | ✅ done (difficulty-weighted, `StratumServer::share_tally()`) |
+| Per-miner **share accounting** for reward-splitting | ✅ done (difficulty-weighted, `StratumServer::share_tally()`; kept per login, survives disconnects, written to `stratum_shares.json`) |
 | Per-worker **adaptive vardiff** (per-connection target that tracks its hashrate) | ⛔ not yet (single pool-wide share target) |
 | Extranonce partitioning (avoid overlap at large scale) | partial: each rig starts at a random nonce, so rigs do not search the same nonces; server-assigned disjoint ranges not yet |
 | Client auto-reconnect | ⛔ not yet (supervise the client) |
@@ -143,7 +143,10 @@ miners from the pool wallet based on their contribution.
 
 The server now **measures** contribution: `StratumServer::share_tally()` returns
 a difficulty-weighted valid-share count per miner `login` (conventionally
-`<miner_address>.<worker>`). An operator distributes a matured block's coinbase
+`<miner_address>.<worker>`). The tally is kept per `login` rather than per
+connection and written to `stratum_shares.json` (path:
+`COINCYNC_STRATUM_TALLY_PATH`), so it survives a miner's disconnect and a node
+restart. An operator distributes a matured block's coinbase
 in proportion to these weights — a simple proportional/PPLNS split. What is *not*
 yet automated is per-worker **adaptive vardiff**: every miner shares the one
 pool-wide `share_difficulty`, so the tally is only fair when miners have
