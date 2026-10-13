@@ -76,12 +76,14 @@
 //!   `spawn_job_updater`** — INVARIANT: `share_tally` weights valid shares per
 //!   login and skips empty logins; the tally is kept on `StratumStats`, not on
 //!   the connection, and the job updater writes it to the tally file whenever
-//!   it moved, so a disconnect or a restart loses no credit; the job updater
-//!   rotates jobs on tip change. THREAT: mis-weighted payout accounting, or
-//!   credit lost with a dropped connection. TESTS:
+//!   it moved (temp file + rename, and once more from `flush_tally` at node
+//!   shutdown), so a disconnect, a restart or a crash mid-write loses no credit;
+//!   the job updater rotates jobs on tip change. THREAT: mis-weighted payout
+//!   accounting, or credit lost with a dropped connection. TESTS:
 //!   `share_tally_weights_valid_shares_per_login_skips_empty`,
 //!   `share_tally_survives_disconnect_and_reload`,
-//!   `test_load_tally_corrupt_json_is_safe_empty`.
+//!   `test_load_tally_corrupt_json_is_safe_empty`,
+//!   `flush_tally_replaces_the_file_and_leaves_no_tmp`.
 //! - **§10 coinbase / merkle helpers (`create_coinbase_prefix` / `create_coinbase_suffix`
 //!   / `compute_merkle_branches` / `difficulty_to_nbits` / `format_mining_notify`)** —
 //!   INVARIANT: the coinbase prefix/suffix layout and merkle branches match the
@@ -643,6 +645,16 @@ impl StratumServer {
     pub fn stop(&self) {
         self.running.store(false, Ordering::SeqCst);
         info!("Stratum server stopped");
+    }
+
+    /// Write the share tally now. The job updater writes it once a second
+    /// while running; the node calls this at shutdown so the last second of
+    /// shares is on disk too.
+    pub async fn flush_tally(&self) {
+        if let Some(path) = &self.tally_path {
+            let tally = self.stats.read().await.share_tally.clone();
+            persist_tally(path, &tally);
+        }
     }
 
     /// Get server statistics
@@ -1843,7 +1855,12 @@ fn load_tally(path: &std::path::Path) -> HashMap<String, u128> {
 
 fn persist_tally(path: &std::path::Path, tally: &HashMap<String, u128>) {
     if let Ok(raw) = serde_json::to_string_pretty(tally) {
-        if let Err(e) = std::fs::write(path, raw) {
+        // Write next to the file and rename over it, so a crash mid-write
+        // cannot leave a truncated tally that loads as empty.
+        let mut tmp = path.as_os_str().to_owned();
+        tmp.push(".tmp");
+        let tmp = PathBuf::from(tmp);
+        if let Err(e) = std::fs::write(&tmp, raw).and_then(|()| std::fs::rename(&tmp, path)) {
             warn!(
                 "Failed to persist Stratum share tally {}: {}",
                 path.display(),
@@ -3028,6 +3045,33 @@ mod tests {
         let tally = load_tally(&path);
         let _ = std::fs::remove_file(path);
         assert!(tally.is_empty());
+    }
+
+    #[tokio::test]
+    async fn flush_tally_replaces_the_file_and_leaves_no_tmp() {
+        let chain = Arc::new(crate::chain::Blockchain::new());
+        let mempool = crate::mempool::SharedMempool::new();
+        let mut server = StratumServer::new(StratumConfig::default(), chain, mempool);
+        let uniq = format!(
+            "coincync-stratum-shares-flush-{}-{}.json",
+            std::process::id(),
+            timestamp_now_ms()
+        );
+        let path = std::env::temp_dir().join(uniq);
+        std::fs::write(&path, b"{\"old\":1}").expect("write");
+        server.tally_path = Some(path.clone());
+        server.flush_tally().await;
+        assert!(
+            load_tally(&path).is_empty(),
+            "an empty tally replaces the old file"
+        );
+        credit_share(&mut server.stats.write().await.share_tally, "miner.a", 1000);
+        server.flush_tally().await;
+        let loaded = load_tally(&path);
+        let tmp = PathBuf::from(format!("{}.tmp", path.display()));
+        let _ = std::fs::remove_file(&path);
+        assert!(!tmp.exists(), "the temp file is renamed away");
+        assert_eq!(loaded.get("miner.a").copied(), Some(1000));
     }
 
     /// Share::verify classifies a share as Valid / Block / Invalid purely by
