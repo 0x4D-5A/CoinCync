@@ -2012,6 +2012,9 @@ mod tests {
         assert!(!RPC_ALLOWED_METHODS.contains(&"transfer"));
         assert!(!RPC_ALLOWED_METHODS.contains(&"get_mining_live"));
         assert!(!RPC_ALLOWED_METHODS.contains(&"get_metrics"));
+        assert!(!RPC_ALLOWED_METHODS.contains(&"get_stratum_stats"));
+        assert!(!RPC_ALLOWED_METHODS.contains(&"get_stratum_tally"));
+        assert!(!RPC_ALLOWED_METHODS.contains(&"close_stratum_round"));
         assert!(!RPC_ALLOWED_METHODS.contains(&"get_decoys"));
         assert!(RPC_ALLOWED_METHODS.contains(&"get_decoy_distribution"));
         assert!(RPC_ALLOWED_METHODS.contains(&"get_outputs_by_locators"));

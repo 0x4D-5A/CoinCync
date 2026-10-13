@@ -634,6 +634,7 @@ mod tests {
             stratum_native_tls_enabled: false,
             stratum_tls_proxy_ack: false,
             stratum_transport_hardened: false,
+            stratum: Default::default(),
         }
     }
 

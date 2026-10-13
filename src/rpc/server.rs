@@ -4,7 +4,7 @@
 //! jsonrpsee with the method groups assembled by `handlers`.
 
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use http::{Request, Response, StatusCode};
 use jsonrpsee::server::{HttpBody, ServerBuilder, ServerHandle};
@@ -15,6 +15,7 @@ use tracing::{info, warn};
 use crate::chain::SharedBlockchain;
 use crate::error::{Error, Result};
 use crate::mempool::SharedMempool;
+use crate::mining::stratum::StratumServer;
 use crate::network::P2PNode;
 
 use super::handlers::{create_rpc_module, RpcState};
@@ -84,11 +85,17 @@ impl Default for RpcConfig {
 /// Handle returned by `start_rpc_server` — drop to stop the server.
 pub struct RpcServer {
     handle: ServerHandle,
+    stratum: Arc<OnceLock<Arc<StratumServer>>>,
 }
 
 impl RpcServer {
     pub fn stop(self) {
         let _ = self.handle.stop();
+    }
+
+    /// Give the pool RPCs their server. The node starts the pool after the RPC.
+    pub fn attach_stratum(&self, pool: Arc<StratumServer>) {
+        let _ = self.stratum.set(pool);
     }
 }
 
@@ -447,10 +454,12 @@ pub async fn start_rpc_server(
         );
     }
 
+    let stratum = Arc::new(OnceLock::new());
     let state = RpcState {
         chain,
         mempool,
         p2p,
+        stratum: stratum.clone(),
         network_name: config.network_name.clone(),
         auth_enabled: config.auth_enabled,
         // Privacy hardening: default metadata minimization on public listeners.
@@ -549,7 +558,7 @@ pub async fn start_rpc_server(
 
     let handle = server.start(module);
 
-    Ok(RpcServer { handle })
+    Ok(RpcServer { handle, stratum })
 }
 
 #[cfg(test)]
