@@ -1290,9 +1290,6 @@ pub async fn run_pool(
     network: NetworkType,
     threads: usize,
 ) -> Result<()> {
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-    use tokio::net::TcpStream;
-
     bind_randomx_genesis_for_network(network);
     let n_threads = if threads == 0 {
         std::thread::available_parallelism()
@@ -1301,6 +1298,67 @@ pub async fn run_pool(
     } else {
         threads
     };
+
+    let hasher = Hasher::new();
+    // Start at a random nonce: two rigs on the same pool get the same job and,
+    // with the same thread count, would otherwise hash identical nonces and
+    // trade "duplicate share" rejections (server-assigned ranges are the
+    // roadmap item that replaces this).
+    let mut nonce_base: u64 = rand::random();
+    info!("pool: nonce base {:#018x}", nonce_base);
+
+    // Reconnect with backoff when the link drops. A rejected login is final:
+    // every retry would cost another strike at the pool.
+    let mut backoff = BackoffState::new();
+    loop {
+        let started = Instant::now();
+        match pool_session(
+            pool_addr,
+            login,
+            password,
+            hasher,
+            n_threads,
+            &mut nonce_base,
+        )
+        .await
+        {
+            Ok(SessionEnd::Dropped) => {}
+            Ok(SessionEnd::LoginRejected) => {
+                return Err(anyhow!("pool {pool_addr} rejected the login"));
+            }
+            Err(e) => warn!("pool: {e:#}"),
+        }
+        if started.elapsed() >= Duration::from_secs(30) {
+            backoff.reset();
+        }
+        let wait = backoff.next();
+        warn!("pool: reconnecting to {} in {}s", pool_addr, wait.as_secs());
+        tokio::time::sleep(wait).await;
+    }
+}
+
+enum SessionEnd {
+    Dropped,
+    LoginRejected,
+}
+
+const LINK_UP: u8 = 0;
+const LINK_DOWN: u8 = 1;
+const LINK_REJECTED: u8 = 2;
+
+/// One pool connection: log in, mine the pushed jobs and submit, until the
+/// link drops or the pool rejects the login.
+async fn pool_session(
+    pool_addr: &str,
+    login: &str,
+    password: &str,
+    hasher: Hasher,
+    n_threads: usize,
+    nonce_base: &mut u64,
+) -> Result<SessionEnd> {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::TcpStream;
 
     let stream = TcpStream::connect(pool_addr)
         .await
@@ -1321,7 +1379,9 @@ pub async fn run_pool(
 
     // Latest job, updated by the reader task; the mining loop reads it.
     let (job_tx, mut job_rx) = tokio::sync::watch::channel::<Option<PoolJob>>(None);
-    tokio::spawn(async move {
+    let link = Arc::new(AtomicU8::new(LINK_UP));
+    let link_r = link.clone();
+    let reader_task = tokio::spawn(async move {
         let mut line = String::new();
         loop {
             line.clear();
@@ -1365,6 +1425,11 @@ pub async fn run_pool(
                         }
                     } else if v.get("error").map(|e| !e.is_null()).unwrap_or(false) {
                         warn!("pool: server error: {}", v.get("error").unwrap());
+                        // id 1 is the login; a rejected login ends the session for good.
+                        if v.get("id").and_then(|i| i.as_u64()) == Some(1) {
+                            link_r.store(LINK_REJECTED, Ordering::Relaxed);
+                            break;
+                        }
                     }
                 }
                 Err(e) => {
@@ -1373,17 +1438,11 @@ pub async fn run_pool(
                 }
             }
         }
+        let _ = link_r.compare_exchange(LINK_UP, LINK_DOWN, Ordering::Relaxed, Ordering::Relaxed);
     });
 
-    let hasher = Hasher::new();
-    // Start at a random nonce: two rigs on the same pool get the same job and,
-    // with the same thread count, would otherwise hash identical nonces and
-    // trade "duplicate share" rejections (server-assigned ranges are the
-    // roadmap item that replaces this).
-    let mut nonce_base: u64 = rand::random();
-    info!("pool: nonce base {:#018x}", nonce_base);
     let mut submit_id: u64 = 2;
-    loop {
+    while link.load(Ordering::Relaxed) == LINK_UP {
         let Some(job) = job_rx.borrow_and_update().as_ref().cloned() else {
             if job_rx.changed().await.is_err() {
                 break;
@@ -1404,7 +1463,7 @@ pub async fn run_pool(
             job.target,
             n_threads,
             deadline,
-            nonce_base,
+            *nonce_base,
             async {
                 let _ = job_rx.changed().await;
             },
@@ -1415,7 +1474,7 @@ pub async fn run_pool(
             MineResult::Timeout { total_attempts, .. } => *total_attempts,
             MineResult::Aborted { total_attempts, .. } => *total_attempts,
         };
-        nonce_base = nonce_base.wrapping_add(attempts).wrapping_add(1);
+        *nonce_base = nonce_base.wrapping_add(attempts).wrapping_add(1);
 
         if matches!(result, MineResult::Aborted { .. }) {
             if job_rx.has_changed().is_err() {
@@ -1430,6 +1489,11 @@ pub async fn run_pool(
             // Don't submit against a job the pool has already superseded.
             if job_rx.has_changed().unwrap_or(true) {
                 continue;
+            }
+            // The link may have gone while this batch ran; a write to a
+            // half-closed socket still "succeeds" locally.
+            if link.load(Ordering::Relaxed) != LINK_UP {
+                break;
             }
             let submit = serde_json::json!({
                 "id": submit_id, "method": "submit",
@@ -1446,7 +1510,12 @@ pub async fn run_pool(
             info!("pool: submitted nonce {:x} for job {}", nonce, job.job_id);
         }
     }
-    Ok(())
+    reader_task.abort();
+    Ok(if link.load(Ordering::Relaxed) == LINK_REJECTED {
+        SessionEnd::LoginRejected
+    } else {
+        SessionEnd::Dropped
+    })
 }
 
 /// Build the full BlockHeader + transaction list from a daemon template.
