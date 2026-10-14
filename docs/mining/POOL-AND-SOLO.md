@@ -147,7 +147,10 @@ connection and written to `stratum_shares.json` (path:
 restart. An operator distributes a matured block's coinbase
 in proportion to these weights — a simple proportional/PPLNS split. Each
 connection's share target is sized to its own hashrate (vardiff), so the weighted
-tally stays fair across mixed hardware.
+tally stays fair across mixed hardware. A share is credited at the difficulty it
+was checked at, which on testnet and mainnet is the worker's own (the block
+difficulty there is far above any share target); only regtest, whose block
+difficulty sits below 1000, clamps it lower.
 
 ---
 

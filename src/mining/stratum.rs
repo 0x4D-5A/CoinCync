@@ -545,7 +545,8 @@ impl Worker {
         }
         let difficulty = u128::from(self.difficulty);
         let step = u128::from(VARDIFF_MAX_STEP);
-        let next = (difficulty * measured / wanted.max(1)).clamp(difficulty / step, difficulty * step);
+        let next = (difficulty.saturating_mul(measured) / wanted.max(1))
+            .clamp(difficulty / step, difficulty.saturating_mul(step));
         let floor = floor.max(1);
         let ceiling = ceiling.min(VARDIFF_MAX_DIFFICULTY).max(floor);
         let next = next.clamp(u128::from(floor), u128::from(ceiling));
