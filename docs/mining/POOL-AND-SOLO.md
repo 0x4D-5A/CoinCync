@@ -147,8 +147,11 @@ connection and written to `stratum_shares.json` (path:
 restart. An operator distributes a matured block's coinbase
 in proportion to these weights — a simple proportional/PPLNS split. Each
 connection's share target is sized to its own hashrate (vardiff), so the weighted
-tally stays fair across mixed hardware. A share is credited at the difficulty it
-was checked at, which on testnet and mainnet is the worker's own (the block
+tally stays fair across mixed hardware. A share is credited with the hashes
+behind the target it was checked at. That target keeps only the leading zero
+bits of the difficulty, so it is a power of two: a share at the default 1000 is
+worth 512, one at 2720 is worth 2048, the same scale for every worker. The
+difficulty checked is the worker's own on testnet and mainnet (the block
 difficulty there is far above any share target); only regtest, whose block
 difficulty sits below 1000, clamps it lower.
 
@@ -169,7 +172,8 @@ Ordered upgrades to move the reference pool from "great for my boxes" to
    share target, resized to its measured rate (a window of ten shares, a step only
    outside half to twice the wanted rate, at most x4 per step, between
    `share_difficulty` and the block difficulty); the job is pushed again
-   with the new `share_target`, and shares are credited at the difficulty they met.
+   with the new `share_target`, and shares are credited with the work behind the
+   target they met.
 4. **Extranonce partitioning** — hand each miner a disjoint nonce region so a
    large farm doesn't waste hashrate on overlap (today each rig starts at a
    random nonce, which removes the overlap for a small pool).

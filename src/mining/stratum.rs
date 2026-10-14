@@ -97,12 +97,14 @@
 //!   that rate is outside half to twice the wanted one, moves at most x4 per step,
 //!   stays within `share_difficulty`
 //!   and the job's block difficulty (capped at `VARDIFF_MAX_DIFFICULTY`), shares
-//!   are checked and credited at the effective difficulty, and a share found
+//!   are checked at the effective difficulty and credited with the hashes
+//!   behind that target (`share_work`, a power of two), and a share found
 //!   against the previous target is still accepted for a grace period; 0 turns
 //!   it off. THREAT:
 //!   a fast farm floods the pool (or a laptop never submits), or a retarget
 //!   rejects honest in-flight shares. TESTS:
-//!   `vardiff_sizes_difficulty_to_the_measured_rate_within_bounds`.
+//!   `vardiff_sizes_difficulty_to_the_measured_rate_within_bounds`,
+//!   `share_work_is_the_power_of_two_target_difficulty`.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -1104,6 +1106,14 @@ fn effective_share_difficulty(requested: u64, block_target: &Hash) -> u64 {
     requested.min(block_difficulty).max(1)
 }
 
+/// Hashes expected behind one share at `difficulty`. The share target keeps
+/// only the leading zero bits (`Hash::from_difficulty`), so a nominal 1000 is
+/// really 512, and a credit that tracks work has to count what the target
+/// asked for.
+fn share_work(difficulty: u64) -> u64 {
+    Hash::from_difficulty(difficulty).to_difficulty()
+}
+
 /// The job as sent on the wire. Emits **distinct** `share_target` and
 /// `block_target` (issue #44) so the two meanings are never conflated; `target`
 /// is kept as an alias of `share_target` for older clients. The share target is
@@ -1384,8 +1394,9 @@ async fn handle_stratum_message(
                     )
                 }
             };
-            // Checked and credited at the effective difficulty: the worker's,
-            // clamped to the block difficulty like the target it was sent.
+            // Checked at the effective difficulty: the worker's, clamped to the
+            // block difficulty like the target it was sent. Credited with the
+            // hashes behind that target.
             let effective = effective_share_difficulty(difficulty, &job.target);
             if !pow.meets_difficulty(&Hash::from_difficulty(effective)) {
                 let mut wr = workers.write().await;
@@ -1430,7 +1441,7 @@ async fn handle_stratum_message(
                 s.total_shares += 1;
                 s.valid_shares += 1;
                 if let Some((login, stepped)) = credit {
-                    credit_share(&mut s.share_tally, &login, effective);
+                    credit_share(&mut s.share_tally, &login, share_work(effective));
                     if let Some((new_difficulty, tx)) = stepped {
                         info!(
                             "vardiff: worker {} difficulty {}",
@@ -2511,8 +2522,8 @@ mod tests {
         assert_eq!(stats.read().await.blocks_found, 1, "one block found");
         assert_eq!(
             stats.read().await.share_tally.get("pool.w").copied(),
-            Some(1000),
-            "the valid share is credited to the login at the share difficulty"
+            Some(512),
+            "the valid share is credited with the work behind the 1000 target"
         );
     }
 
@@ -3175,6 +3186,16 @@ mod tests {
         let tally = load_tally(&path);
         let _ = std::fs::remove_file(path);
         assert!(tally.is_empty());
+    }
+
+    #[test]
+    fn share_work_is_the_power_of_two_target_difficulty() {
+        assert_eq!(share_work(0), 1);
+        assert_eq!(share_work(1), 1);
+        assert_eq!(share_work(1000), 512);
+        assert_eq!(share_work(1024), 1024);
+        assert_eq!(share_work(2720), 2048);
+        assert_eq!(share_work(u64::MAX), 1 << 63);
     }
 
     #[test]
