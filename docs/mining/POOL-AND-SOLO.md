@@ -150,7 +150,7 @@ restart. The node's JSON-RPC reads it: `get_stratum_stats` returns the pool
 totals, a hashrate estimate and one entry per connected worker (login,
 difficulty, shares, work, hashrate, seconds since connect and last submit),
 `get_stratum_tally` returns the tally with credits as decimal strings, and
-`close_stratum_round` moves the tally to `stratum_shares.<unix time>.json`
+`close_stratum_round` moves the tally to `stratum_shares.<unix time in ms>.json`
 next to the live file and starts the next round from zero, without a restart.
 The close is a mutating call and sits behind the same RPC auth as
 `submit_block`; none of the three is reachable through the public REST proxy.

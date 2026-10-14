@@ -752,7 +752,7 @@ impl StratumServer {
         if stats.share_tally.is_empty() {
             return Err(Error::InvalidState("share tally is empty".into()));
         }
-        let file = path.with_extension(format!("{}.json", timestamp_now()));
+        let file = path.with_extension(format!("{}.json", timestamp_now_ms()));
         let raw = serde_json::to_string_pretty(&stats.share_tally)
             .map_err(|e| Error::SerializationError(e.to_string()))?;
         std::fs::OpenOptions::new()
