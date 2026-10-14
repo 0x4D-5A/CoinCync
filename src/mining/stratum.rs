@@ -78,12 +78,17 @@
 //!   the connection, and the job updater writes it to the tally file whenever
 //!   it moved (temp file + rename, and once more from `flush_tally` at node
 //!   shutdown), so a disconnect, a restart or a crash mid-write loses no credit;
-//!   the job updater rotates jobs on tip change. THREAT: mis-weighted payout
-//!   accounting, or credit lost with a dropped connection. TESTS:
+//!   `write_tally` lets one writer at a time hold the file from snapshot to
+//!   rename, so an older snapshot never lands over a newer file; an
+//!   unparseable tally is moved aside as `<file>.corrupt` rather than started
+//!   over; the job updater rotates jobs on tip change. THREAT: mis-weighted
+//!   payout accounting, or credit lost with a dropped connection, a torn
+//!   write or two writers. TESTS:
 //!   `share_tally_weights_valid_shares_per_login_skips_empty`,
 //!   `share_tally_survives_disconnect_and_reload`,
 //!   `test_load_tally_corrupt_json_is_safe_empty`,
-//!   `flush_tally_replaces_the_file_and_leaves_no_tmp`.
+//!   `flush_tally_replaces_the_file_and_leaves_no_tmp`,
+//!   `flush_tally_waits_for_the_running_writer`.
 //! - **§10 coinbase / merkle helpers (`create_coinbase_prefix` / `create_coinbase_suffix`
 //!   / `compute_merkle_branches` / `difficulty_to_nbits` / `format_mining_notify`)** —
 //!   INVARIANT: the coinbase prefix/suffix layout and merkle branches match the
@@ -520,6 +525,8 @@ pub struct StratumServer {
     /// Where the per-login share tally is written (`COINCYNC_STRATUM_TALLY_PATH`,
     /// default `stratum_shares.json`); see §9.
     tally_path: Option<PathBuf>,
+    /// Held by whoever writes the tally file, see `write_tally`.
+    tally_lock: Arc<tokio::sync::Mutex<()>>,
     /// Optional P2P handle so a pool-found block is broadcast to peers. Without
     /// it, an accepted block stays local — fine for an isolated regtest node,
     /// but on a real network the pool would fork away from its peers.
@@ -566,6 +573,7 @@ impl StratumServer {
             bans: Arc::new(RwLock::new(bans)),
             banlist_path,
             tally_path,
+            tally_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -652,8 +660,7 @@ impl StratumServer {
     /// shares is on disk too.
     pub async fn flush_tally(&self) {
         if let Some(path) = &self.tally_path {
-            let tally = self.stats.read().await.share_tally.clone();
-            persist_tally(path, &tally);
+            write_tally(&self.tally_lock, &self.stats, path).await;
         }
     }
 
@@ -691,6 +698,7 @@ impl StratumServer {
         let payout_view = self.config.payout_view_public;
         let stats = self.stats.clone();
         let tally_path = self.tally_path.clone();
+        let tally_lock = self.tally_lock.clone();
 
         tokio::spawn(async move {
             let mut last_tip = Hash::zero();
@@ -788,14 +796,8 @@ impl StratumServer {
                 // Write the share tally when it moved: at most one file write
                 // per second, outside the stats lock.
                 if let Some(path) = tally_path.as_ref() {
-                    let snapshot = {
-                        let s = stats.read().await;
-                        (s.valid_shares != persisted_valid_shares)
-                            .then(|| (s.valid_shares, s.share_tally.clone()))
-                    };
-                    if let Some((valid, tally)) = snapshot {
-                        persisted_valid_shares = valid;
-                        persist_tally(path, &tally);
+                    if stats.read().await.valid_shares != persisted_valid_shares {
+                        persisted_valid_shares = write_tally(&tally_lock, &stats, path).await;
                     }
                 }
 
@@ -1842,21 +1844,54 @@ fn credit_share(tally: &mut HashMap<String, u128>, login: &str, difficulty: u64)
 fn load_tally(path: &std::path::Path) -> HashMap<String, u128> {
     match std::fs::read_to_string(path) {
         Ok(raw) => serde_json::from_str::<HashMap<String, u128>>(&raw).unwrap_or_else(|e| {
-            warn!(
-                "Failed to parse Stratum share tally {}: {}",
-                path.display(),
-                e
-            );
+            // Keep the bad file instead of starting empty and writing over it.
+            let mut aside = path.as_os_str().to_owned();
+            aside.push(".corrupt");
+            let aside = PathBuf::from(aside);
+            match std::fs::rename(path, &aside) {
+                Ok(()) => warn!(
+                    "Failed to parse Stratum share tally {}: {}; moved aside as {}",
+                    path.display(),
+                    e,
+                    aside.display()
+                ),
+                Err(re) => warn!(
+                    "Failed to parse Stratum share tally {}: {}; could not move it aside: {}",
+                    path.display(),
+                    e,
+                    re
+                ),
+            }
             HashMap::new()
         }),
         Err(_) => HashMap::new(),
     }
 }
 
+/// Snapshot the tally and write it, one writer at a time from snapshot to
+/// rename: the job updater and the shutdown flush both come through here, so
+/// an older snapshot is never renamed over a newer file. Returns the valid
+/// share count the snapshot was taken at.
+async fn write_tally(
+    lock: &tokio::sync::Mutex<()>,
+    stats: &RwLock<StratumStats>,
+    path: &std::path::Path,
+) -> u64 {
+    let _writer = lock.lock().await;
+    let (valid, tally) = {
+        let s = stats.read().await;
+        (s.valid_shares, s.share_tally.clone())
+    };
+    persist_tally(path, &tally);
+    valid
+}
+
 fn persist_tally(path: &std::path::Path, tally: &HashMap<String, u128>) {
     if let Ok(raw) = serde_json::to_string_pretty(tally) {
         // Write next to the file and rename over it, so a crash mid-write
-        // cannot leave a truncated tally that loads as empty.
+        // cannot leave a truncated tally that loads as empty. Atomic, not
+        // fsync-durable: a power loss right after can still lose this write,
+        // and the next checkpoint rewrites it.
         let mut tmp = path.as_os_str().to_owned();
         tmp.push(".tmp");
         let tmp = PathBuf::from(tmp);
@@ -3043,8 +3078,44 @@ mod tests {
         let path = std::env::temp_dir().join(uniq);
         std::fs::write(&path, b"{not-json").expect("write");
         let tally = load_tally(&path);
-        let _ = std::fs::remove_file(path);
+        let aside = PathBuf::from(format!("{}.corrupt", path.display()));
+        let moved = !path.exists();
+        let kept = std::fs::read(&aside);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&aside);
         assert!(tally.is_empty());
+        assert!(
+            moved,
+            "the bad file is moved aside, not left to be written over"
+        );
+        assert_eq!(kept.expect("corrupt copy").as_slice(), b"{not-json");
+    }
+
+    #[tokio::test]
+    async fn flush_tally_waits_for_the_running_writer() {
+        let chain = Arc::new(crate::chain::Blockchain::new());
+        let mempool = crate::mempool::SharedMempool::new();
+        let mut server = StratumServer::new(StratumConfig::default(), chain, mempool);
+        let uniq = format!(
+            "coincync-stratum-shares-lock-{}-{}.json",
+            std::process::id(),
+            timestamp_now_ms()
+        );
+        let path = std::env::temp_dir().join(uniq);
+        server.tally_path = Some(path.clone());
+        let server = Arc::new(server);
+        credit_share(&mut server.stats.write().await.share_tally, "miner.a", 1000);
+        let writer = server.tally_lock.clone().lock_owned().await;
+        let flushing = server.clone();
+        let flush = tokio::spawn(async move { flushing.flush_tally().await });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(!flush.is_finished(), "the flush waits for the writer");
+        assert!(!path.exists());
+        drop(writer);
+        flush.await.expect("flush");
+        let loaded = load_tally(&path);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(loaded.get("miner.a").copied(), Some(1000));
     }
 
     #[tokio::test]
