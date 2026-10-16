@@ -117,7 +117,7 @@ If any count/result differs from §5, the baseline shifted — re-derive before 
 | `-p spark-connector --features libspark-ffi` | Shim + `LibsparkBackend`; incl. #258 strict tests (`verify_rejects_a_substituted_cover_set`, `verify_rejects_value_balance_the_spend_does_not_release`) | **25 passing** (Windows/MSVC, production params) |
 | `--lib spark_payload` | Store-aware verify + guards; incl. the #308 empty-cover guard and `end_to_end_v2_payload_verify_then_apply` (real libspark) | **12 passing** (Windows/MSVC, production params) |
 | 24h in-block soak (test params, N≤16) | mint/transfer/spend/double-spend/reorg state machine via the real block hooks | **PASSED 2026-10-01: 329,214 cycles, 0 anomalies** over 24h |
-| 24h in-block soak (**production params, N=32768**) | same, at the shipped Grootle params | **IN PROGRESS** — this is the pre-audit gate; result to be pinned here |
+| 24h in-block soak (**production params, N=32768**) | same, at the shipped Grootle params | **PASSED 2026-10-15: 382,100 cycles, 0 anomalies** over 24h (86,400s), seed=828927513140 |
 | Vendored crypto | Grootle/Chaum/BPPlus soundness | Inherits **Firo's libspark audit** (§7) |
 
 ---
@@ -177,10 +177,24 @@ If any count/result differs from §5, the baseline shifted — re-derive before 
 
 - **Activation is `u64::MAX`** on testnet/mainnet — shielded is off until this
   audit clears. Regtest activation (height 100) exists only under `sketch-gk-proof`.
-- **Production-param soak in progress** (§5) — the audit baseline is not final
-  until it completes clean and its cycle count is pinned.
-- **Shielded-specific fuzz coverage** is not yet enumerated here — to be added or
-  declared explicitly before submission.
+- **Production-param soak COMPLETE** (§5) — passed clean on 2026-10-15:
+  382,100 cycles, 0 anomalies over the full 24h (86,400s), seed=828927513140.
+  The pre-audit soak gate is satisfied.
+- **Shielded-specific fuzz coverage** is enumerated below (property-based,
+  `proptest`), in `src/consensus/spark_payload.rs` under `mod tests::fuzz`:
+  - `decode_never_panics_on_arbitrary_bytes` — `SparkPayload::decode` on arbitrary
+    peer-controlled byte strings always returns `Err` and never panics (the
+    peer-input decode surface).
+  - `decode_encode_roundtrip_is_stable` — for any payload that decodes,
+    `decode → encode → decode` is a fixed point (no information loss / drift in the
+    canonical form).
+  - `value_bridge_never_panics` — the Pedersen value bridge tolerates arbitrary
+    `value_balance` inputs (incl. the `i64::MIN`/`unsigned_abs` edge) without
+    panicking.
+  These are test-only and change no consensus decode/verify behaviour. Decode is
+  the only peer-controlled parse surface on the shielded path; the spend/mint
+  bundles are opaque byte blobs handed to libspark, whose own fuzzing is out of
+  this repo's scope and noted in §9.
 - **Value conservation across the veil** is enforced by the transparent bridge
   (`verify_transparent_shielded_balance`) plus the spend's own libspark
   balance/range proof; confirm this composition is complete for every tx shape.
