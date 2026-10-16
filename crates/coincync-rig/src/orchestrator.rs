@@ -36,12 +36,13 @@
 //!   mid-search, our submission gets rejected and we restart. That's
 //!   the same posture the existing `coincync-miner` ships with.
 
+use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use serde_json::Value;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use coincync::config::NetworkType;
 use coincync::consensus::{bind_randomx_genesis_for_network, Block, BlockHeader, PowAlgorithm};
@@ -743,8 +744,16 @@ pub async fn run_solo(
         // Pass the daemon as the tip source so the search aborts early if the
         // chain reaches `height` (someone else mined this block) — rebuild on
         // the new tip instead of hashing a stale template to the deadline.
-        let result =
-            mine_parallel(hasher, input, target, threads, deadline, 0, Some(daemon), height).await;
+        let result = mine_parallel(
+            hasher,
+            input,
+            target,
+            threads,
+            deadline,
+            0,
+            wait_for_new_tip(daemon, height),
+        )
+        .await;
 
         // 5. Submit if found
         match result {
@@ -921,8 +930,8 @@ enum MineResult {
 /// Multi-threaded nonce search. Each thread owns a slice of the u64
 /// nonce space and hashes (input, nonce) until either:
 ///  - it finds a nonce that meets target (signals via channel), or
-///  - the shared `stop` flag goes true (some other thread won, or
-///    the poll deadline elapsed), or
+///  - the shared `stop` flag goes true (some other thread won, the
+///    poll deadline elapsed, or `abort` resolved), or
 ///  - it exhausts its slice (shouldn't happen at testnet difficulty
 ///    inside one poll interval — slice is u64::MAX/threads).
 ///
@@ -931,7 +940,6 @@ enum MineResult {
 /// for milliseconds per hash, which is exactly what async runtimes
 /// hate. Keeping them as `std::thread::spawn` lets the tokio runtime
 /// stay responsive (the timeout race below depends on it).
-#[allow(clippy::too_many_arguments)] // nonce-search job: block inputs + target + control signals
 async fn mine_parallel(
     hasher: Hasher,
     input: HashInput,
@@ -945,13 +953,10 @@ async fn mine_parallel(
     // of the SAME job don't re-test identical nonces. It is reduced modulo the
     // slice size, so threads never cross into each other's slices.
     nonce_base: u64,
-    // Tip-abort (Ghost-Bridge Stream 1). When `Some`, the async race polls this
-    // daemon's tip every 2s and aborts the search the instant the chain reaches
-    // `abort_height` (the height we're mining) — so a new block elsewhere makes
-    // us rebuild immediately instead of hashing a stale template to the
-    // deadline. `None` (stratum/pool) disables it; the pool drives job changes.
-    tip_source: Option<&DaemonClient>,
-    abort_height: u64,
+    // Resolves when the work went stale: solo mode polls the daemon tip
+    // (`wait_for_new_tip`), pool mode waits for the next job. The search then
+    // stops within one batch instead of hashing to the deadline.
+    abort: impl Future<Output = ()>,
 ) -> MineResult {
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -1064,11 +1069,10 @@ async fn mine_parallel(
     } else {
         deadline.saturating_duration_since(now)
     };
-    // Race three ways: a worker finds a nonce, the deadline fires, or the chain
-    // tip advances to/past `abort_height` (Ghost-Bridge Stream 1 early-abort).
-    // The tip poll runs on THIS async task so it can borrow the daemon client;
-    // the std::thread workers are halted by the `stop` store below regardless of
-    // which arm wins.
+    // Race three ways: a worker finds a nonce, the deadline fires, or `abort`
+    // resolves. `abort` runs on THIS async task so it can borrow the caller's
+    // state; the std::thread workers are halted by the `stop` store below
+    // regardless of which arm wins.
     let mut found: Option<u64> = None;
     let aborted;
     tokio::select! {
@@ -1076,7 +1080,7 @@ async fn mine_parallel(
             found = match r { Ok(Some(n)) => Some(n), _ => None };
             aborted = false;
         }
-        _ = wait_for_new_tip(tip_source, abort_height) => {
+        _ = abort => {
             aborted = true;
         }
     }
@@ -1121,17 +1125,8 @@ async fn mine_parallel(
 
 /// Resolve when the chain tip reaches/passes `abort_height` — i.e. the chain
 /// advanced to or beyond the height we're currently mining, so our template is
-/// stale (Ghost-Bridge Stream 1 early-abort). Polls `get_info` every 2s. With
-/// no tip source (stratum/pool mode, which drives job changes itself) it never
-/// resolves, leaving the found/deadline arms to decide the race.
-async fn wait_for_new_tip(tip_source: Option<&DaemonClient>, abort_height: u64) {
-    let d = match tip_source {
-        Some(d) => d,
-        None => {
-            std::future::pending::<()>().await;
-            return;
-        }
-    };
+/// stale (Ghost-Bridge Stream 1 early-abort). Polls `get_info` every 2s.
+async fn wait_for_new_tip(d: &DaemonClient, abort_height: u64) {
     loop {
         tokio::time::sleep(Duration::from_secs(2)).await;
         if let Ok(info) = d.get_info().await {
@@ -1325,8 +1320,7 @@ pub async fn run_pool(
     info!("pool: logged in to {} as {}", pool_addr, login);
 
     // Latest job, updated by the reader task; the mining loop reads it.
-    let job_slot: Arc<tokio::sync::Mutex<Option<PoolJob>>> = Arc::new(tokio::sync::Mutex::new(None));
-    let job_slot_r = job_slot.clone();
+    let (job_tx, mut job_rx) = tokio::sync::watch::channel::<Option<PoolJob>>(None);
     tokio::spawn(async move {
         let mut line = String::new();
         loop {
@@ -1367,7 +1361,7 @@ pub async fn run_pool(
                                 continue;
                             }
                             info!("pool: new job {} (height {})", job.job_id, job.height);
-                            *job_slot_r.lock().await = Some(job);
+                            job_tx.send_replace(Some(job));
                         }
                     } else if v.get("error").map(|e| !e.is_null()).unwrap_or(false) {
                         warn!("pool: server error: {}", v.get("error").unwrap());
@@ -1390,9 +1384,10 @@ pub async fn run_pool(
     info!("pool: nonce base {:#018x}", nonce_base);
     let mut submit_id: u64 = 2;
     loop {
-        let job = { job_slot.lock().await.clone() };
-        let Some(job) = job else {
-            tokio::time::sleep(Duration::from_millis(250)).await;
+        let Some(job) = job_rx.borrow_and_update().as_ref().cloned() else {
+            if job_rx.changed().await.is_err() {
+                break;
+            }
             continue;
         };
         let input = HashInput {
@@ -1400,12 +1395,19 @@ pub async fn run_pool(
             tx_root: job.tx_root,
             height: job.height,
         };
-        // Short deadline so we pick up newly-pushed jobs promptly.
+        // A new job from the pool stops the batch; the deadline only bounds a
+        // batch on a job the pool keeps.
         let deadline = Instant::now() + Duration::from_secs(4);
-        // Stratum/pool mode: no daemon tip source — the pool pushes new jobs,
-        // so tip-abort is disabled (None, 0); job supersession is handled below.
         let result = mine_parallel(
-            hasher, input, job.target, n_threads, deadline, nonce_base, None, 0,
+            hasher,
+            input,
+            job.target,
+            n_threads,
+            deadline,
+            nonce_base,
+            async {
+                let _ = job_rx.changed().await;
+            },
         )
         .await;
         let attempts = match &result {
@@ -1415,15 +1417,18 @@ pub async fn run_pool(
         };
         nonce_base = nonce_base.wrapping_add(attempts).wrapping_add(1);
 
+        if matches!(result, MineResult::Aborted { .. }) {
+            if job_rx.has_changed().is_err() {
+                break;
+            }
+            debug!(
+                "pool: job {} replaced by the pool, stopped after {} hashes",
+                job.job_id, attempts
+            );
+        }
         if let MineResult::Found { nonce, .. } = result {
             // Don't submit against a job the pool has already superseded.
-            let still_current = job_slot
-                .lock()
-                .await
-                .as_ref()
-                .map(|j| j.job_id == job.job_id)
-                .unwrap_or(false);
-            if !still_current {
+            if job_rx.has_changed().unwrap_or(true) {
                 continue;
             }
             let submit = serde_json::json!({
@@ -1661,6 +1666,36 @@ mod tests {
 
     /// Issue #45: the rig must accept a job whose advertised seed matches the
     /// locally derived RandomX seed for that height, and reject a mismatched one.
+    /// Real RandomX, so ignored by default. Run with `--ignored` and
+    /// COINCYNC_RANDOMX_LIGHT_MODE=1 to skip the dataset build.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn mine_parallel_stops_when_abort_resolves() {
+        use super::{
+            bind_randomx_genesis_for_network, mine_parallel, HashInput, Hasher, MineResult,
+            NetworkType,
+        };
+        use coincync::primitives::Hash;
+        use std::time::{Duration, Instant};
+        bind_randomx_genesis_for_network(NetworkType::Regtest);
+        let input = HashInput {
+            anchor: Hash::from_bytes([7u8; 32]),
+            tx_root: Hash::from_bytes([9u8; 32]),
+            height: 1,
+        };
+        let never = Hash::from_bytes([0u8; 32]);
+        let started = Instant::now();
+        let deadline = started + Duration::from_secs(60);
+        let abort = tokio::time::sleep(Duration::from_millis(300));
+        let r = mine_parallel(Hasher::new(), input, never, 2, deadline, 0, abort).await;
+        assert!(matches!(r, MineResult::Aborted { .. }));
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "abort took {:?}",
+            started.elapsed()
+        );
+    }
+
     #[test]
     fn pool_job_seed_is_validated_against_local_network() {
         use super::{parse_pool_job, pool_job_seed_ok};
