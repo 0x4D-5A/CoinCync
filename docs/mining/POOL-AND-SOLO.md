@@ -78,17 +78,15 @@ coincync-node --network mainnet --stratum 0.0.0.0:3333 --stratum-address <POOL_A
 | Fork-safe, mempool-synced submission | ✅ done |
 | Pool-wide **share difficulty** (job carries a share target below the block target) | ✅ done (`share_difficulty`, default 1000) |
 | Per-miner **share accounting** for reward-splitting | ✅ done (difficulty-weighted, `StratumServer::share_tally()`; kept per login, survives disconnects, written to `stratum_shares.json`; read and closed over RPC) |
-| Per-worker **adaptive vardiff** (per-connection target that tracks its hashrate) | ⛔ not yet (single pool-wide share target) |
+| Per-worker **adaptive vardiff** (per-connection target that tracks its hashrate) | ✅ done (each connection starts at `share_difficulty` and is resized to its measured share rate; `COINCYNC_STRATUM_VARDIFF_TARGET` = shares per minute, default 10, 0 = off) |
 | Extranonce partitioning (avoid overlap at large scale) | partial: each rig starts at a random nonce, so rigs do not search the same nonces; server-assigned disjoint ranges not yet |
 | Client auto-reconnect | ⛔ not yet (supervise the client) |
 
 So today the reference pool measures each miner's contribution (weighted shares
-per `login`) and pays the pool's own address on every block — enough to run a
-**small reward-splitting public pool** where all miners have comparable hashrate.
-The gap for a *large* public pool is **per-worker adaptive vardiff** (so a fast
-farm and a laptop each submit at a steady rate against a target sized to them)
-and extranonce partitioning (roadmap, §5). `src/mining/pool.rs` is the unwired
-reference for that vardiff + PPLNS-window layer.
+per `login`), sizes each connection's share target to its hashrate, and pays the
+pool's own address on every block — enough to run a **reward-splitting public
+pool**. What is left for a *large* pool is extranonce partitioning (roadmap, §5).
+`src/mining/pool.rs` is the unwired reference for the PPLNS-window layer.
 
 ---
 
@@ -103,7 +101,7 @@ Newline-delimited JSON-RPC over one TCP connection (optionally TLS). Four method
 ```
 Authenticates (optional shared password) and returns the current job.
 
-### `job` (pushed by the server on a new tip)
+### `job` (pushed by the server on a new tip, and again with a new `share_target` when the miner's difficulty changes)
 ```json
 ← {"jsonrpc":"2.0","method":"job","params":{
      "job_id":"...", "algo":"cync/rx",
@@ -145,21 +143,25 @@ The server now **measures** contribution: `StratumServer::share_tally()` returns
 a difficulty-weighted valid-share count per miner `login` (conventionally
 `<miner_address>.<worker>`). The tally is kept per `login` rather than per
 connection and written to `stratum_shares.json` (path:
-`COINCYNC_STRATUM_TALLY_PATH`), so it survives a miner's disconnect and a node
-restart. The node's JSON-RPC reads it: `get_stratum_stats` returns the pool
-totals, a hashrate estimate and one entry per connected worker (login,
-difficulty, shares, work, hashrate, seconds since connect and last submit),
-`get_stratum_tally` returns the tally with credits as decimal strings, and
-`close_stratum_round` moves the tally to `stratum_shares.<unix time in ms>.json`
-next to the live file and starts the next round from zero, without a restart.
-The close is a mutating call and sits behind the same RPC auth as
-`submit_block`; none of the three is reachable through the public REST proxy.
-An operator distributes a matured block's coinbase
-in proportion to these weights — a simple proportional/PPLNS split. What is *not*
-yet automated is per-worker **adaptive vardiff**: every miner shares the one
-pool-wide `share_difficulty`, so the tally is only fair when miners have
-comparable hashrate. For a farm with wildly mixed hardware, add vardiff first
-(§5) — `src/mining/pool.rs` is the reference for that layer.
+`COINCYNC_STRATUM_TALLY_PATH`; written once a second and at shutdown), so it
+survives a miner's disconnect and a node restart. The node's JSON-RPC reads it:
+`get_stratum_stats` returns the pool totals, a hashrate estimate and one entry
+per connected worker (login, difficulty, shares, work, hashrate, seconds since
+connect and last submit), `get_stratum_tally` returns the tally with credits as
+decimal strings, and `close_stratum_round` moves the tally to
+`stratum_shares.<unix time in ms>.json` next to the live file and starts the next
+round from zero, without a restart. The close is a mutating call and sits behind
+the same RPC auth as `submit_block`; none of the three is reachable through the
+public REST proxy. An operator distributes a matured block's coinbase
+in proportion to these weights — a simple proportional/PPLNS split. Each
+connection's share target is sized to its own hashrate (vardiff), so the weighted
+tally stays fair across mixed hardware. A share is credited with the hashes
+behind the target it was checked at. That target keeps only the leading zero
+bits of the difficulty, so it is a power of two: a share at the default 1000 is
+worth 512, one at 2720 is worth 2048, the same scale for every worker. The
+difficulty checked is the worker's own on testnet and mainnet (the block
+difficulty there is far above any share target); only regtest, whose block
+difficulty sits below 1000, clamps it lower.
 
 ---
 
@@ -174,9 +176,12 @@ Ordered upgrades to move the reference pool from "great for my boxes" to
 2. ~~**Share accounting**~~ — ✅ done: `StratumServer::share_tally()` returns
    difficulty-weighted valid shares per miner `login`, the input to any payout
    scheme.
-3. **Per-worker adaptive vardiff** — give each connection its *own* share target
-   and adjust it to its measured hashrate, so a laptop and a farm both submit at
-   a steady rate and the share tally is fair across mixed hardware.
+3. ~~**Per-worker adaptive vardiff**~~ — ✅ done: each connection has its own
+   share target, resized to its measured rate (a window of ten shares, a step only
+   outside half to twice the wanted rate, at most x4 per step, between
+   `share_difficulty` and the block difficulty); the job is pushed again
+   with the new `share_target`, and shares are credited with the work behind the
+   target they met.
 4. **Extranonce partitioning** — hand each miner a disjoint nonce region so a
    large farm doesn't waste hashrate on overlap (today each rig starts at a
    random nonce, which removes the overlap for a small pool).

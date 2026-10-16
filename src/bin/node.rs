@@ -2022,6 +2022,7 @@ async fn start_node(
     // real candidate blocks and, on a winning share, assembles + submits +
     // broadcasts them through the same validated path as submit_block. Without
     // --stratum-address it runs shares-only (no block production).
+    let mut stratum_server = None;
     if let Some(stratum_bind) = stratum {
         match stratum_bind.parse::<std::net::SocketAddr>() {
             Ok(bind_addr) => {
@@ -2056,6 +2057,7 @@ async fn start_node(
                     "Starting Stratum pool on {} (block_production={})",
                     bind_addr, block_production
                 );
+                stratum_server = Some(server.clone());
                 tokio::spawn(async move {
                     if let Err(e) = server.start().await {
                         error!("Stratum server exited: {}", e);
@@ -2329,6 +2331,10 @@ async fn start_node(
             Ok(0) => {}
             Ok(n) => info!("Mempool: saved {} txs to disk", n),
             Err(e) => error!("Mempool: save_to_disk failed: {}", e),
+        }
+        if let Some(s) = &stratum_server {
+            s.stop();
+            s.flush_tally().await;
         }
     };
 

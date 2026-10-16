@@ -77,19 +77,26 @@
 //!   INVARIANT: `share_tally` weights valid shares per
 //!   login and skips empty logins; the tally is kept on `StratumStats`, not on
 //!   the connection, and the job updater writes it to the tally file whenever
-//!   it moved, so a disconnect or a restart loses no credit; the job updater
-//!   rotates jobs on tip change. `close_round` moves the tally to a dated file
-//!   and empties it under one lock, so no share lands in two rounds or in none,
-//!   and it never overwrites an existing round file. `worker_stats` and
-//!   `stats().hashrate` count the real (power-of-two) share target per valid
-//!   share, `share_work`. THREAT: mis-weighted payout accounting, or
-//!   credit lost with a dropped connection or a round close. TESTS:
+//!   it moved (temp file + rename, and once more from `flush_tally` at node
+//!   shutdown), so a disconnect, a restart or a crash mid-write loses no credit;
+//!   `write_tally` lets one writer at a time hold the file from snapshot to
+//!   rename, so an older snapshot never lands over a newer file; an
+//!   unparseable tally is moved aside as `<file>.corrupt` rather than started
+//!   over. `close_round` moves the tally to a dated file and empties it under
+//!   one lock, so no share lands in two rounds or in none, and it never
+//!   overwrites an existing round file. `worker_stats` and `stats().hashrate`
+//!   count the real (power-of-two) share target per valid share, `share_work`.
+//!   The job updater rotates jobs on tip change. THREAT: mis-weighted payout
+//!   accounting, or credit lost with a dropped connection, a round close, a torn
+//!   write or two writers. TESTS:
 //!   `share_tally_weights_valid_shares_per_login_skips_empty`,
 //!   `share_tally_survives_disconnect_and_reload`,
 //!   `test_load_tally_corrupt_json_is_safe_empty`,
 //!   `close_round_moves_the_tally_to_a_dated_file_and_starts_the_next_from_zero`,
 //!   `worker_stats_and_pool_hashrate_follow_the_work_behind_valid_shares`,
-//!   `share_work_is_the_power_of_two_target_difficulty`.
+//!   `share_work_is_the_power_of_two_target_difficulty`,
+//!   `flush_tally_replaces_the_file_and_leaves_no_tmp`,
+//!   `flush_tally_waits_for_the_running_writer`.
 //! - **§10 coinbase / merkle helpers (`create_coinbase_prefix` / `create_coinbase_suffix`
 //!   / `compute_merkle_branches` / `difficulty_to_nbits` / `format_mining_notify`)** —
 //!   INVARIANT: the coinbase prefix/suffix layout and merkle branches match the
@@ -99,6 +106,20 @@
 //!   `coinbase_suffix_layout`, `merkle_branches_empty_mempool_is_empty`,
 //!   `test_difficulty_to_nbits`, `difficulty_to_nbits_zero_and_shift_guard`,
 //!   `test_mining_notify_format`.
+//! - **§11 `Worker::retarget` / `Worker::accept_difficulty` (vardiff)** —
+//!   INVARIANT: a worker's share difficulty is sized to its measured rate once a
+//!   window holds ten shares (or a minute in which ten were expected), only when
+//!   that rate is outside half to twice the wanted one, moves at most x4 per step,
+//!   stays within `share_difficulty`
+//!   and the job's block difficulty (capped at `VARDIFF_MAX_DIFFICULTY`), shares
+//!   are checked at the effective difficulty and credited with the hashes
+//!   behind that target (`share_work`, a power of two), and a share found
+//!   against the previous target is still accepted for a grace period; 0 turns
+//!   it off. THREAT:
+//!   a fast farm floods the pool (or a laptop never submits), or a retarget
+//!   rejects honest in-flight shares. TESTS:
+//!   `vardiff_sizes_difficulty_to_the_measured_rate_within_bounds`,
+//!   `share_work_is_the_power_of_two_target_difficulty`.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -118,6 +139,15 @@ use crate::mining::block_builder::{self, CandidateBlock};
 use crate::primitives::{Hash, PublicKey};
 
 const MIN_SUBMIT_INTERVAL_MS: u64 = 200;
+/// Vardiff: a window closes once it holds this many shares, or after this long
+/// if that many were expected in it; the difficulty moves at most this factor
+/// per step and never above this ceiling, and a share found against the
+/// previous target is still accepted this long after a step.
+const VARDIFF_WINDOW_SHARES: u32 = 10;
+const VARDIFF_WINDOW_MS: u64 = 60_000;
+const VARDIFF_MAX_STEP: u64 = 4;
+const VARDIFF_MAX_DIFFICULTY: u64 = 1_000_000_000;
+const VARDIFF_GRACE_MS: u64 = 10_000;
 const MAX_INVALID_STREAK: u32 = 20;
 const STRATUM_BAN_THRESHOLD: u32 = 20;
 const STRATUM_BAN_DURATION_SECS: u64 = 3600;
@@ -151,6 +181,9 @@ pub struct StratumConfig {
     pub pool_fee: f64,
     /// Share difficulty
     pub share_difficulty: u64,
+    /// Per-worker vardiff: valid shares per minute each connection should
+    /// settle at. 0 turns it off and every worker keeps `share_difficulty`.
+    pub vardiff_shares_per_minute: u32,
     /// Job timeout in seconds
     pub job_timeout: u64,
     /// Maximum connections
@@ -195,6 +228,10 @@ impl Default for StratumConfig {
             bind_addr: bind_literal.parse().expect("valid literal socket address"),
             pool_fee: 1.0,
             share_difficulty: 1000,
+            vardiff_shares_per_minute: std::env::var("COINCYNC_STRATUM_VARDIFF_TARGET")
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+                .unwrap_or(10),
             job_timeout: 60,
             max_connections: 1000,
             auth_password: std::env::var("COINCYNC_STRATUM_PASSWORD")
@@ -469,6 +506,14 @@ struct Worker {
     work: u64,
     /// Difficulty
     difficulty: u64,
+    /// Vardiff: wanted shares per minute (0 = off), valid shares since
+    /// `window_start_ms`, and the difficulty before the last step with the
+    /// time of that step.
+    vardiff_per_minute: u32,
+    window_shares: u32,
+    window_start_ms: u64,
+    prev_difficulty: u64,
+    retarget_ms: u64,
     /// Set true after successful `mining.authorize`.
     authorized: bool,
     /// Timestamp (ms) of last submit attempt.
@@ -487,6 +532,58 @@ impl Worker {
     /// Average hashrate since the connection came up, from `work`.
     fn hashrate(&self, now: u64) -> u64 {
         self.work / now.saturating_sub(self.connected_at).max(1)
+    }
+
+    /// The difficulty a share is checked and credited at: the current one, or
+    /// the lower of current and previous right after a step, so a share found
+    /// against the old target is not thrown away.
+    fn accept_difficulty(&self, now_ms: u64) -> u64 {
+        if now_ms.saturating_sub(self.retarget_ms) < VARDIFF_GRACE_MS {
+            self.difficulty.min(self.prev_difficulty)
+        } else {
+            self.difficulty
+        }
+    }
+
+    /// Count a valid share and, once the window holds enough of them to mean
+    /// something, size the difficulty to the measured rate, between `floor`
+    /// and `ceiling` (the job's block difficulty: a share is never asked to be
+    /// harder than a block, see `effective_share_difficulty`). Only a rate
+    /// outside half to twice the wanted one moves it; a few shares per minute
+    /// is too noisy for a tighter band. Returns the new difficulty when it changed.
+    fn retarget(&mut self, now_ms: u64, floor: u64, ceiling: u64) -> Option<u64> {
+        if self.vardiff_per_minute == 0 {
+            return None;
+        }
+        self.window_shares = self.window_shares.saturating_add(1);
+        let elapsed_ms = now_ms.saturating_sub(self.window_start_ms);
+        // Shares seen and shares wanted in this window, both times 60 000.
+        let measured = u128::from(self.window_shares) * 60_000;
+        let wanted = u128::from(self.vardiff_per_minute) * u128::from(elapsed_ms);
+        let enough = u128::from(VARDIFF_WINDOW_SHARES) * 60_000;
+        if measured < enough && (elapsed_ms < VARDIFF_WINDOW_MS || wanted < enough) {
+            return None;
+        }
+        self.window_shares = 0;
+        self.window_start_ms = now_ms;
+        if measured < wanted * 2 && measured * 2 > wanted {
+            return None;
+        }
+        let difficulty = u128::from(self.difficulty);
+        let step = u128::from(VARDIFF_MAX_STEP);
+        let next = (difficulty.saturating_mul(measured) / wanted.max(1))
+            .clamp(difficulty / step, difficulty.saturating_mul(step));
+        let floor = floor.max(1);
+        let ceiling = ceiling.min(VARDIFF_MAX_DIFFICULTY).max(floor);
+        let next = next.clamp(u128::from(floor), u128::from(ceiling));
+        let next = u64::try_from(next).unwrap_or(ceiling);
+        if next == self.difficulty {
+            return None;
+        }
+        self.prev_difficulty = self.difficulty;
+        self.difficulty = next;
+        self.retarget_ms = now_ms;
+        Some(next)
     }
 }
 
@@ -564,6 +661,8 @@ pub struct StratumServer {
     /// Where the per-login share tally is written (`COINCYNC_STRATUM_TALLY_PATH`,
     /// default `stratum_shares.json`); see §9.
     tally_path: Option<PathBuf>,
+    /// Held by whoever writes the tally file, see `write_tally`.
+    tally_lock: Arc<tokio::sync::Mutex<()>>,
     /// Optional P2P handle so a pool-found block is broadcast to peers. Without
     /// it, an accepted block stays local — fine for an isolated regtest node,
     /// but on a real network the pool would fork away from its peers.
@@ -610,6 +709,7 @@ impl StratumServer {
             bans: Arc::new(RwLock::new(bans)),
             banlist_path,
             tally_path,
+            tally_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -689,6 +789,15 @@ impl StratumServer {
     pub fn stop(&self) {
         self.running.store(false, Ordering::SeqCst);
         info!("Stratum server stopped");
+    }
+
+    /// Write the share tally now. The job updater writes it once a second
+    /// while running; the node calls this at shutdown so the last second of
+    /// shares is on disk too.
+    pub async fn flush_tally(&self) {
+        if let Some(path) = &self.tally_path {
+            write_tally(&self.tally_lock, &self.stats, path).await;
+        }
     }
 
     /// Get server statistics
@@ -802,6 +911,7 @@ impl StratumServer {
         let payout_view = self.config.payout_view_public;
         let stats = self.stats.clone();
         let tally_path = self.tally_path.clone();
+        let tally_lock = self.tally_lock.clone();
 
         tokio::spawn(async move {
             let mut last_tip = Hash::zero();
@@ -899,14 +1009,8 @@ impl StratumServer {
                 // Write the share tally when it moved: at most one file write
                 // per second, outside the stats lock.
                 if let Some(path) = tally_path.as_ref() {
-                    let snapshot = {
-                        let s = stats.read().await;
-                        (s.valid_shares != persisted_valid_shares)
-                            .then(|| (s.valid_shares, s.share_tally.clone()))
-                    };
-                    if let Some((valid, tally)) = snapshot {
-                        persisted_valid_shares = valid;
-                        persist_tally(path, &tally);
+                    if stats.read().await.valid_shares != persisted_valid_shares {
+                        persisted_valid_shares = write_tally(&tally_lock, &stats, path).await;
                     }
                 }
 
@@ -932,6 +1036,7 @@ impl StratumServer {
         let candidates = self.candidates.clone();
         let p2p = self.p2p.clone();
         let share_difficulty = self.config.share_difficulty;
+        let vardiff_per_minute = self.config.vardiff_shares_per_minute;
         let required_password = self.config.auth_password.clone();
         let bans = self.bans.clone();
         let banlist_path = self.banlist_path.clone();
@@ -954,6 +1059,11 @@ impl StratumServer {
                 invalid_shares: 0,
                 work: 0,
                 difficulty: share_difficulty,
+                vardiff_per_minute,
+                window_shares: 0,
+                window_start_ms: timestamp_now_ms(),
+                prev_difficulty: share_difficulty,
+                retarget_ms: 0,
                 authorized: false,
                 last_submit_ms: 0,
                 invalid_breaker: crate::colony::guard::breaker::CircuitBreaker::new("stratum_worker", "CYNC-GUARD-STRATUM", MAX_INVALID_STREAK as u64),
@@ -967,6 +1077,7 @@ impl StratumServer {
 
             // Spawn writer task
             let write_running = running.clone();
+            let write_workers = workers.clone();
             tokio::spawn(async move {
                 while write_running.load(Ordering::SeqCst) {
                     tokio::select! {
@@ -981,7 +1092,13 @@ impl StratumServer {
                         }
                         job = job_rx.recv() => {
                             if let Ok(job) = job {
-                                let notify = format_cync_job_notify(&job, share_difficulty);
+                                let difficulty = write_workers
+                                    .read()
+                                    .await
+                                    .get(&worker_id)
+                                    .map(|w| w.difficulty)
+                                    .unwrap_or(share_difficulty);
+                                let notify = format_cync_job_notify(&job, difficulty);
                                 if writer.write_all(notify.as_bytes()).await.is_err() {
                                     break;
                                 }
@@ -1128,7 +1245,8 @@ fn effective_share_difficulty(requested: u64, block_target: &Hash) -> u64 {
 
 /// Hashes expected behind one share at `difficulty`. The share target keeps
 /// only the leading zero bits (`Hash::from_difficulty`), so a nominal 1000 is
-/// really 512 and the rate math has to count what the target asked for.
+/// really 512, and a credit that tracks work has to count what the target
+/// asked for.
 fn share_work(difficulty: u64) -> u64 {
     Hash::from_difficulty(difficulty).to_difficulty()
 }
@@ -1155,7 +1273,8 @@ fn cync_job_json(job: &MiningJob, share_difficulty: u64) -> serde_json::Value {
     })
 }
 
-/// A pushed `job` notification (sent to a logged-in miner on a tip change).
+/// A pushed `job` notification: sent to a logged-in miner on a tip change, and
+/// again with a new share target when vardiff moved the worker's difficulty.
 fn format_cync_job_notify(job: &MiningJob, share_difficulty: u64) -> String {
     serde_json::json!({
         "jsonrpc": "2.0",
@@ -1296,11 +1415,17 @@ async fn handle_stratum_message(
                 }
             }
             info!("login: worker {} authorized as {}", worker_id, login_name);
+            let difficulty = workers
+                .read()
+                .await
+                .get(&worker_id)
+                .map(|w| w.difficulty)
+                .unwrap_or(share_difficulty);
             let job_val = current_job
                 .read()
                 .await
                 .as_ref()
-                .map(|j| cync_job_json(j, share_difficulty))
+                .map(|j| cync_job_json(j, difficulty))
                 .unwrap_or(serde_json::Value::Null);
             Some(
                 serde_json::json!({
@@ -1339,9 +1464,10 @@ async fn handle_stratum_message(
                 }
             };
             // Cadence throttle.
-            {
+            let difficulty = {
                 let now_ms = timestamp_now_ms();
                 let mut ww = workers.write().await;
+                let mut difficulty = share_difficulty;
                 if let Some(w) = ww.get_mut(&worker_id) {
                     if w.last_submit_ms > 0
                         && now_ms.saturating_sub(w.last_submit_ms) < MIN_SUBMIT_INTERVAL_MS
@@ -1355,8 +1481,10 @@ async fn handle_stratum_message(
                     }
                     w.last_submit_ms = now_ms;
                     w.last_activity = timestamp_now();
+                    difficulty = w.accept_difficulty(now_ms);
                 }
-            }
+                difficulty
+            };
             // Server-owned per-canonical-job dedup. Rejects a stale/non-current
             // job id BEFORE touching the ledger (so it can't wipe the accepted
             // set) and rejects a replayed nonce before any PoW is recomputed.
@@ -1403,8 +1531,11 @@ async fn handle_stratum_message(
                     )
                 }
             };
-            let share_target_difficulty = effective_share_difficulty(share_difficulty, &job.target);
-            if !pow.meets_difficulty(&Hash::from_difficulty(share_target_difficulty)) {
+            // Checked at the effective difficulty: the worker's, clamped to the
+            // block difficulty like the target it was sent. Credited with the
+            // hashes behind that target.
+            let effective = effective_share_difficulty(difficulty, &job.target);
+            if !pow.meets_difficulty(&Hash::from_difficulty(effective)) {
                 let mut wr = workers.write().await;
                 if let Some(w) = wr.get_mut(&worker_id) {
                     w.invalid_shares += 1;
@@ -1432,20 +1563,35 @@ async fn handle_stratum_message(
                 );
             }
             {
-                let work = share_work(share_target_difficulty);
+                let work = share_work(effective);
                 let mut wr = workers.write().await;
                 let credit = wr.get_mut(&worker_id).map(|w| {
                     w.valid_shares += 1;
                     w.work += work;
                     w.invalid_breaker.record_success();
-                    (w.payout_login.clone(), w.difficulty)
+                    let stepped = w.retarget(
+                        timestamp_now_ms(),
+                        share_difficulty,
+                        job.target.to_difficulty(),
+                    );
+                    (w.payout_login.clone(), stepped.map(|d| (d, w.tx.clone())))
                 });
                 let mut s = stats.write().await;
                 s.total_shares += 1;
                 s.valid_shares += 1;
                 s.work += work;
-                if let Some((login, difficulty)) = credit {
-                    credit_share(&mut s.share_tally, &login, difficulty);
+                if let Some((login, stepped)) = credit {
+                    credit_share(&mut s.share_tally, &login, work);
+                    if let Some((new_difficulty, tx)) = stepped {
+                        info!(
+                            "vardiff: worker {} difficulty {}",
+                            worker_id, new_difficulty
+                        );
+                        // The same job again with the new share target. A full
+                        // channel can wait for the next tip: the writer reads the
+                        // worker's difficulty on every broadcast anyway.
+                        let _ = tx.try_send(format_cync_job_notify(&job, new_difficulty));
+                    }
                 }
             }
             if pow.meets_difficulty(&job.target) {
@@ -1962,20 +2108,58 @@ fn credit_share(tally: &mut HashMap<String, u128>, login: &str, difficulty: u64)
 fn load_tally(path: &std::path::Path) -> HashMap<String, u128> {
     match std::fs::read_to_string(path) {
         Ok(raw) => serde_json::from_str::<HashMap<String, u128>>(&raw).unwrap_or_else(|e| {
-            warn!(
-                "Failed to parse Stratum share tally {}: {}",
-                path.display(),
-                e
-            );
+            // Keep the bad file instead of starting empty and writing over it.
+            let mut aside = path.as_os_str().to_owned();
+            aside.push(".corrupt");
+            let aside = PathBuf::from(aside);
+            match std::fs::rename(path, &aside) {
+                Ok(()) => warn!(
+                    "Failed to parse Stratum share tally {}: {}; moved aside as {}",
+                    path.display(),
+                    e,
+                    aside.display()
+                ),
+                Err(re) => warn!(
+                    "Failed to parse Stratum share tally {}: {}; could not move it aside: {}",
+                    path.display(),
+                    e,
+                    re
+                ),
+            }
             HashMap::new()
         }),
         Err(_) => HashMap::new(),
     }
 }
 
+/// Snapshot the tally and write it, one writer at a time from snapshot to
+/// rename: the job updater and the shutdown flush both come through here, so
+/// an older snapshot is never renamed over a newer file. Returns the valid
+/// share count the snapshot was taken at.
+async fn write_tally(
+    lock: &tokio::sync::Mutex<()>,
+    stats: &RwLock<StratumStats>,
+    path: &std::path::Path,
+) -> u64 {
+    let _writer = lock.lock().await;
+    let (valid, tally) = {
+        let s = stats.read().await;
+        (s.valid_shares, s.share_tally.clone())
+    };
+    persist_tally(path, &tally);
+    valid
+}
+
 fn persist_tally(path: &std::path::Path, tally: &HashMap<String, u128>) {
     if let Ok(raw) = serde_json::to_string_pretty(tally) {
-        if let Err(e) = std::fs::write(path, raw) {
+        // Write next to the file and rename over it, so a crash mid-write
+        // cannot leave a truncated tally that loads as empty. Atomic, not
+        // fsync-durable: a power loss right after can still lose this write,
+        // and the next checkpoint rewrites it.
+        let mut tmp = path.as_os_str().to_owned();
+        tmp.push(".tmp");
+        let tmp = PathBuf::from(tmp);
+        if let Err(e) = std::fs::write(&tmp, raw).and_then(|()| std::fs::rename(&tmp, path)) {
             warn!(
                 "Failed to persist Stratum share tally {}: {}",
                 path.display(),
@@ -2200,6 +2384,11 @@ mod tests {
             invalid_shares: 0,
             work: 0,
             difficulty: 1000,
+            vardiff_per_minute: 0,
+            window_shares: 0,
+            window_start_ms: timestamp_now_ms(),
+            prev_difficulty: 1000,
+            retarget_ms: 0,
             authorized: true,
             // Force immediate throttle path.
             last_submit_ms: timestamp_now_ms(),
@@ -2350,6 +2539,11 @@ mod tests {
             invalid_shares: 0,
             work: 0,
             difficulty: 1000,
+            vardiff_per_minute: 0,
+            window_shares: 0,
+            window_start_ms: timestamp_now_ms(),
+            prev_difficulty: 1000,
+            retarget_ms: 0,
             authorized: true,
             last_submit_ms: 0,
             invalid_breaker: crate::colony::guard::breaker::CircuitBreaker::new("stratum_worker", "CYNC-GUARD-STRATUM", MAX_INVALID_STREAK as u64),
@@ -2467,6 +2661,11 @@ mod tests {
             invalid_shares: 0,
             work: 0,
             difficulty: 1000,
+            vardiff_per_minute: 0,
+            window_shares: 0,
+            window_start_ms: timestamp_now_ms(),
+            prev_difficulty: 1000,
+            retarget_ms: 0,
             authorized: false,
             last_submit_ms: 0,
             invalid_breaker: crate::colony::guard::breaker::CircuitBreaker::new("stratum_worker", "CYNC-GUARD-STRATUM", MAX_INVALID_STREAK as u64),
@@ -2507,8 +2706,8 @@ mod tests {
         assert_eq!(stats.read().await.blocks_found, 1, "one block found");
         assert_eq!(
             stats.read().await.share_tally.get("pool.w").copied(),
-            Some(1000),
-            "the valid share is credited to the login at the share difficulty"
+            Some(512),
+            "the valid share is credited with the work behind the 1000 target"
         );
     }
 
@@ -2625,6 +2824,11 @@ mod tests {
             invalid_shares: 0,
             work: 0,
             difficulty: 1000,
+            vardiff_per_minute: 0,
+            window_shares: 0,
+            window_start_ms: timestamp_now_ms(),
+            prev_difficulty: 1000,
+            retarget_ms: 0,
             authorized,
             last_submit_ms: 0,
             invalid_breaker: crate::colony::guard::breaker::CircuitBreaker::new("stratum_worker", "CYNC-GUARD-STRATUM", MAX_INVALID_STREAK as u64),
@@ -3166,8 +3370,71 @@ mod tests {
         let path = std::env::temp_dir().join(uniq);
         std::fs::write(&path, b"{not-json").expect("write");
         let tally = load_tally(&path);
-        let _ = std::fs::remove_file(path);
+        let aside = PathBuf::from(format!("{}.corrupt", path.display()));
+        let moved = !path.exists();
+        let kept = std::fs::read(&aside);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&aside);
         assert!(tally.is_empty());
+        assert!(
+            moved,
+            "the bad file is moved aside, not left to be written over"
+        );
+        assert_eq!(kept.expect("corrupt copy").as_slice(), b"{not-json");
+    }
+
+    #[tokio::test]
+    async fn flush_tally_waits_for_the_running_writer() {
+        let chain = Arc::new(crate::chain::Blockchain::new());
+        let mempool = crate::mempool::SharedMempool::new();
+        let mut server = StratumServer::new(StratumConfig::default(), chain, mempool);
+        let uniq = format!(
+            "coincync-stratum-shares-lock-{}-{}.json",
+            std::process::id(),
+            timestamp_now_ms()
+        );
+        let path = std::env::temp_dir().join(uniq);
+        server.tally_path = Some(path.clone());
+        let server = Arc::new(server);
+        credit_share(&mut server.stats.write().await.share_tally, "miner.a", 1000);
+        let writer = server.tally_lock.clone().lock_owned().await;
+        let flushing = server.clone();
+        let flush = tokio::spawn(async move { flushing.flush_tally().await });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(!flush.is_finished(), "the flush waits for the writer");
+        assert!(!path.exists());
+        drop(writer);
+        flush.await.expect("flush");
+        let loaded = load_tally(&path);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(loaded.get("miner.a").copied(), Some(1000));
+    }
+
+    #[tokio::test]
+    async fn flush_tally_replaces_the_file_and_leaves_no_tmp() {
+        let chain = Arc::new(crate::chain::Blockchain::new());
+        let mempool = crate::mempool::SharedMempool::new();
+        let mut server = StratumServer::new(StratumConfig::default(), chain, mempool);
+        let uniq = format!(
+            "coincync-stratum-shares-flush-{}-{}.json",
+            std::process::id(),
+            timestamp_now_ms()
+        );
+        let path = std::env::temp_dir().join(uniq);
+        std::fs::write(&path, b"{\"old\":1}").expect("write");
+        server.tally_path = Some(path.clone());
+        server.flush_tally().await;
+        assert!(
+            load_tally(&path).is_empty(),
+            "an empty tally replaces the old file"
+        );
+        credit_share(&mut server.stats.write().await.share_tally, "miner.a", 1000);
+        server.flush_tally().await;
+        let loaded = load_tally(&path);
+        let tmp = PathBuf::from(format!("{}.tmp", path.display()));
+        let _ = std::fs::remove_file(&path);
+        assert!(!tmp.exists(), "the temp file is renamed away");
+        assert_eq!(loaded.get("miner.a").copied(), Some(1000));
     }
 
     #[test]
@@ -3178,6 +3445,51 @@ mod tests {
         assert_eq!(share_work(1024), 1024);
         assert_eq!(share_work(2720), 2048);
         assert_eq!(share_work(u64::MAX), 1 << 63);
+    }
+
+    #[test]
+    fn vardiff_sizes_difficulty_to_the_measured_rate_within_bounds() {
+        let mut w = mk_worker(true, vec![0, 0, 0, 0]);
+        w.difficulty = 1000;
+        w.prev_difficulty = 1000;
+        w.vardiff_per_minute = 10;
+        w.window_start_ms = 0;
+        // Ten shares in five seconds against ten a minute wanted: the window
+        // closes on the tenth share and the step is capped at x4.
+        for _ in 0..9 {
+            assert_eq!(w.retarget(5_000, 1000, u64::MAX), None);
+        }
+        assert_eq!(w.retarget(5_000, 1000, u64::MAX), Some(4000));
+        assert_eq!(
+            w.accept_difficulty(10_000),
+            1000,
+            "old target inside the grace"
+        );
+        assert_eq!(w.accept_difficulty(16_000), 4000);
+        // Ten shares in the next minute is the wanted rate: no step.
+        for _ in 0..9 {
+            assert_eq!(w.retarget(35_000, 1000, u64::MAX), None);
+        }
+        assert_eq!(w.retarget(65_000, 1000, u64::MAX), None);
+        // Two shares in a minute: down, but never below the floor.
+        assert_eq!(w.retarget(100_000, 1000, u64::MAX), None);
+        assert_eq!(w.retarget(125_000, 1000, u64::MAX), Some(1000));
+        assert_eq!(w.difficulty, 1000);
+        // Off: never steps.
+        w.vardiff_per_minute = 0;
+        w.window_start_ms = 0;
+        for _ in 0..200 {
+            assert_eq!(w.retarget(240_000, 1000, u64::MAX), None);
+        }
+        assert_eq!(w.difficulty, 1000);
+        // Never above the job's block difficulty.
+        w.vardiff_per_minute = 10;
+        w.window_shares = 0;
+        w.window_start_ms = 300_000;
+        for _ in 0..9 {
+            assert_eq!(w.retarget(301_000, 1000, 2500), None);
+        }
+        assert_eq!(w.retarget(301_000, 1000, 2500), Some(2500));
     }
 
     #[tokio::test]

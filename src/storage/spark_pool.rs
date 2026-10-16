@@ -30,13 +30,18 @@
 //! consolidation is follow-up migration, not done here.
 //!
 //! ## Status
-//! Gated `sketch-gk-proof`, **in-memory**, and **unwired from consensus** — it
-//! is inert scaffolding for the shielded-solvency path. RocksDB persistence
-//! (mirroring [`SparkStore::open_with_db`](crate::storage::spark)) and the
-//! chain.rs reorg wiring are deliberate follow-ups; the reorg API
+//! Gated `sketch-gk-proof` (+ `libspark-ffi` for the real backend). **Wired into
+//! the GATED consensus path:** `chain.rs::verify_block_spark_v2` /
+//! `apply_spark_v2_txs` verify against and feed this store, and
+//! `checkpoint_phase2_stores` / `rewind_phase2_stores` drive its reorg API
 //! ([`checkpoint_at_height`](SparkPoolStore::checkpoint_at_height) /
-//! [`rewind`](SparkPoolStore::rewind)) is present so the shape matches the
-//! sibling Phase-2 stores when that wiring lands.
+//! [`rewind`](SparkPoolStore::rewind)) in lock-step with the sibling Phase-2
+//! stores. RocksDB persistence is implemented
+//! ([`open_with_db`](SparkPoolStore::open_with_db)); [`new`](SparkPoolStore::new)
+//! is the in-memory form for tests. Shielded stays **activation-gated OFF**
+//! (activation height `u64::MAX` on testnet/mainnet), so this store is never on
+//! the LIVE consensus path until the external audit clears — but it IS exercised
+//! end-to-end in gated regtest and the 24h in-block soak.
 
 use std::collections::HashMap;
 
@@ -494,7 +499,13 @@ impl SparkPoolStore {
         }
         *pv = after;
         if let Some(p) = &self.persistence {
-            let _ = p.meta.insert(POOL_VALUE_KEY, after.to_le_bytes());
+            // R-61 CLASS site: the pool value is a consensus quantity (the "no
+            // inflation across the veil" gate). A silent persist failure would
+            // let a restart reload a STALE value while coins/tags did persist —
+            // diverging the replayed store. Halt, like add_coin/mark_tag_spent.
+            if let Err(e) = p.meta.insert(POOL_VALUE_KEY, after.to_le_bytes()) {
+                panic!("R-61: spark_pool pool_value write failed: {e}");
+            }
         }
         Ok(())
     }
@@ -537,9 +548,15 @@ impl SparkPoolStore {
     }
 
     /// Persist the current in-memory checkpoint stack to the meta CF (one borsh
-    /// blob under `CHECKPOINTS_KEY`). Best-effort: a serialize/write failure is
-    /// logged, not fatal — the in-memory stack stays authoritative for the
-    /// running session, and the next successful checkpoint rewrites the blob.
+    /// blob under `CHECKPOINTS_KEY`). This is consensus-recovery state, NOT
+    /// best-effort metadata: `open_with_db` reads this stack back on restart and
+    /// `rewind` pops its top, so the on-disk blob decides which pool state is
+    /// restored. If this write were dropped and the node restarted before the
+    /// next checkpoint rewrote the blob, the stack on disk would be one entry
+    /// short — the next disconnect would pop the checkpoint of the block below and
+    /// rewind one block too far, a SILENT wrong rewind (chain.rs reports it as
+    /// RolledBack, not Stranded). So a failure here is R-61 fatal, exactly like
+    /// the coin/tag/pool_value writes — not logged and swallowed.
     fn persist_checkpoints(&self, cps: &[PoolCheckpoint]) {
         let Some(p) = &self.persistence else {
             return;
@@ -552,17 +569,13 @@ impl SparkPoolStore {
                 pool_value: c.pool_value,
             })
             .collect();
-        match borsh::to_vec(&persisted) {
-            Ok(bytes) => {
-                let _ = p.meta.insert(CHECKPOINTS_KEY, bytes);
-            }
-            Err(e) => {
-                tracing::error!(
-                    target: "storage::spark_pool",
-                    error = %e,
-                    "failed to serialize Spark pool checkpoint stack for persistence"
-                );
-            }
+        // R-61 CLASS site: the persisted checkpoint stack determines the restored
+        // rewind state across a restart, so a serialize/write failure must halt.
+        let bytes = borsh::to_vec(&persisted).unwrap_or_else(|e| {
+            panic!("R-61: Spark pool checkpoint-stack borsh serialize failed: {e}")
+        });
+        if let Err(e) = p.meta.insert(CHECKPOINTS_KEY, bytes) {
+            panic!("R-61: spark_pool checkpoint-stack write failed: {e}");
         }
     }
 
@@ -626,11 +639,20 @@ impl SparkPoolStore {
         // Clean persistence so a future `open_with_db` replay reconstructs the
         // rewound state instead of resurrecting the disconnected block.
         if let Some(p) = &self.persistence {
+            // R-61 CLASS site: a rewind must leave on-disk state consistent with
+            // memory. A silent remove failure would resurrect a disconnected
+            // block's coin/tag on the next open_with_db replay, diverging the
+            // store. Halt on failure, symmetric with the add_coin/mark_tag_spent
+            // inserts.
             for idx in &removed_indices {
-                let _ = p.coins.remove(idx.to_be_bytes());
+                if let Err(e) = p.coins.remove(idx.to_be_bytes()) {
+                    panic!("R-61: spark_pool coin rewind-remove failed at cover_index {idx}: {e}");
+                }
             }
             for t in &removed_tags {
-                let _ = p.tags.remove(t.as_slice());
+                if let Err(e) = p.tags.remove(t.as_slice()) {
+                    panic!("R-61: spark_pool tag rewind-remove failed: {e}");
+                }
             }
         }
 
@@ -643,7 +665,11 @@ impl SparkPoolStore {
         // and mirror it to disk, so a reorg (and a later replay) is exact.
         *self.pool_value.write() = restore.pool_value;
         if let Some(p) = &self.persistence {
-            let _ = p.meta.insert(POOL_VALUE_KEY, restore.pool_value.to_le_bytes());
+            // R-61 CLASS site (see apply_value_balance): halt on a persist
+            // failure of the restored pool value.
+            if let Err(e) = p.meta.insert(POOL_VALUE_KEY, restore.pool_value.to_le_bytes()) {
+                panic!("R-61: spark_pool pool_value rewind-restore write failed: {e}");
+            }
         }
         // Mirror the now-shorter checkpoint stack so a replay reconstructs the
         // rewound depth (restart-durable rewind).
@@ -979,7 +1005,7 @@ mod tests {
     #[test]
     fn end_to_end_store_drives_spend_and_unspent_check() {
         use spark_connector::ffi::{
-            build_spend_over_set, cover_set_size, mint_to_seed, serial_context, LibsparkBackend,
+            build_spend_over_set, mint_to_seed, serial_context, LibsparkBackend,
         };
         use spark_connector::SparkBackend;
 
