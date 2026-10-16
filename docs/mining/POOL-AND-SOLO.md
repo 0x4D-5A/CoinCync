@@ -143,8 +143,9 @@ The server now **measures** contribution: `StratumServer::share_tally()` returns
 a difficulty-weighted valid-share count per miner `login` (conventionally
 `<miner_address>.<worker>`). The tally is kept per `login` rather than per
 connection and written to `stratum_shares.json` (path:
-`COINCYNC_STRATUM_TALLY_PATH`), so it survives a miner's disconnect and a node
-restart. An operator distributes a matured block's coinbase
+`COINCYNC_STRATUM_TALLY_PATH`; written once a second and at shutdown), so it
+survives a miner's disconnect and a node restart. An operator distributes a
+matured block's coinbase
 in proportion to these weights — a simple proportional/PPLNS split. Each
 connection's share target is sized to its own hashrate (vardiff), so the weighted
 tally stays fair across mixed hardware. A share is credited with the hashes
