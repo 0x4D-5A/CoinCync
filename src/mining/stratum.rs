@@ -850,13 +850,16 @@ impl StratumServer {
 
     /// Close the payout round: write the tally to a dated file next to the
     /// live one and start the next round from zero. The swap and both writes
-    /// happen under the stats lock, so a share credited meanwhile lands in
-    /// the new round. Refuses to overwrite an existing round file.
+    /// happen under the tally writer mutex and the stats lock, so a share
+    /// credited meanwhile lands in the new round and no other writer can put
+    /// an older snapshot over the emptied live file. Refuses to overwrite an
+    /// existing round file.
     pub async fn close_round(&self) -> Result<ClosedRound> {
         let path = self
             .tally_path
             .as_ref()
             .ok_or_else(|| Error::InvalidState("no share tally file".into()))?;
+        let _writer = self.tally_lock.lock().await;
         let mut stats = self.stats.write().await;
         if stats.share_tally.is_empty() {
             return Err(Error::InvalidState("share tally is empty".into()));
@@ -3522,6 +3525,33 @@ mod tests {
         let stats = server.stats().await;
         assert_eq!(stats.connected_workers, 2);
         assert_eq!(stats.hashrate as u64, ws[1].hashrate);
+    }
+
+    #[tokio::test]
+    async fn close_round_waits_for_the_running_writer() {
+        let chain = Arc::new(crate::chain::Blockchain::new());
+        let mempool = crate::mempool::SharedMempool::new();
+        let mut server = StratumServer::new(StratumConfig::default(), chain, mempool);
+        let uniq = format!(
+            "coincync-stratum-round-lock-{}-{}.json",
+            std::process::id(),
+            timestamp_now_ms()
+        );
+        let path = std::env::temp_dir().join(uniq);
+        server.tally_path = Some(path.clone());
+        let server = Arc::new(server);
+        credit_share(&mut server.stats.write().await.share_tally, "miner.a", 1000);
+        let writer = server.tally_lock.clone().lock_owned().await;
+        let closing = server.clone();
+        let close = tokio::spawn(async move { closing.close_round().await });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(!close.is_finished(), "the close waits for the writer");
+        drop(writer);
+        let round = close.await.expect("join").expect("close");
+        let _ = std::fs::remove_file(&round.file);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(round.logins, 1);
+        assert!(server.share_tally().await.is_empty());
     }
 
     #[tokio::test]
