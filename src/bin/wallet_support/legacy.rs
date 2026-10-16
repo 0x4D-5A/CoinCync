@@ -2333,6 +2333,16 @@ fn mole_notice(amount: u64) {
     eprintln!("        {amount} atomic is burrowing underground (shielded)");
     eprintln!("        - no transparent trace of sender, recipient, or amount.");
     eprintln!("=====================================================");
+    // On-chain shield-in needs a transparent side (ring-signed inputs +
+    // transparent change, value_balance < 0). That path is GATED at consensus:
+    // a block-admitted shielded tx must be pure-shielded until the transparent
+    // bridge is validated and audited (F4, issue #314). A node will REJECT this
+    // broadcast with "transparent inputs/outputs are forbidden". This command
+    // exercises the builder path; it will not relay until #314 lands.
+    eprintln!(" [GATED] on-chain shield-in is disabled until the transparent");
+    eprintln!("         bridge is validated (issue #314) — the node will reject");
+    eprintln!("         this transaction. Builder/testing use only for now.");
+    eprintln!("=====================================================");
 }
 
 /// Self-contained REGTEST run: bootstrap a local pool, fund this wallet, build +
@@ -3504,6 +3514,10 @@ async fn cmd_multisig_gen(
         let path = dir.join(&filename);
         let json = serde_json::to_string_pretty(share).map_err(|e| format!("serialize: {}", e))?;
         std::fs::write(&path, &json).map_err(|e| format!("write {}: {}", path.display(), e))?;
+        // #325: a trusted-dealer key share is secret key material. Harden to
+        // 0600 (Unix) / owner-only ACL (Windows) with the same audited helper
+        // the wallet uses, so it isn't left world-readable under the umask.
+        coincync::wallet::persistence::harden_secret_file_permissions(&path);
         println!(
             "  Share {}: {} ({})",
             share.participant_id,
@@ -3625,6 +3639,10 @@ async fn cmd_multisig_round1(share_file: &str, output: &str) -> Result<(), Strin
         .serialize()
         .map_err(|e| format!("serialize nonces: {}", e))?;
     std::fs::write(&nonce_file, &nonce_bytes).map_err(|e| format!("write nonces: {}", e))?;
+    // #325: the round-1 nonces are secret — anyone who reads them plus this
+    // participant's published signature share can recover the signing share
+    // (RFC 9591). Harden to 0600 / owner-only, matching the wallet's own files.
+    coincync::wallet::persistence::harden_secret_file_permissions(std::path::Path::new(&nonce_file));
 
     println!("  Commitment: {} (share this with other signers)", output);
     println!("  Nonces:     {} (SECRET — keep for round 2)", nonce_file);
