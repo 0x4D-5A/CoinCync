@@ -913,6 +913,23 @@ impl Blockchain {
                 Ok(p) => p,
                 Err(_) => continue, // not a v2 payload (native v1 handled elsewhere)
             };
+            // SECURITY (F4, issue #314): a block-admitted shielded tx MUST be
+            // PURE-SHIELDED — no transparent inputs/outputs and value_balance == 0.
+            // The transparent side of a shielded tx skips RingCT validation, so an
+            // unproven transparent output (or input) fed into the value bridge below
+            // would mint value across the veil. Forbid any transparent side until
+            // the bridge is validated + audited. Fail-closed. The emptiness half is
+            // the single source of truth shared with check_shielded_tx and the
+            // mempool gate (validation::require_pure_shielded_shape); value_balance
+            // == 0 is enforced here for the v2 payload.
+            crate::consensus::validation::require_pure_shielded_shape(tx)
+                .map_err(|e| format!("spark v2 tx {idx}: {e}"))?;
+            if payload.value_balance != 0 {
+                return Err(format!(
+                    "spark v2 tx {idx}: value_balance must be 0 — transparent \
+                     shield-in/unshield is gated until the bridge is validated (#314)"
+                ));
+            }
             // Transparent↔shielded value bridge: the tx's public value_balance
             // must be backed by its transparent commitments (no cross-veil
             // inflation). The shielded side's own conservation is proven by the
@@ -4919,7 +4936,6 @@ mod tests {
         use crate::consensus::spark_payload::derive_outpoint;
         use crate::storage::spark_pool::SparkPoolStore;
         use crate::transaction::{Transaction, TxType};
-        use spark_connector::ffi::cover_set_size;
         use std::sync::Arc;
 
         // A chain with the libspark pool store initialized.
@@ -4938,7 +4954,9 @@ mod tests {
         };
 
         let seed = b"chain-hook-seed";
-        let n = cover_set_size().unwrap();
+        // #311: size the mint to a small set, not the full cover set — production
+        // params (N=32768) make build_mint_payload reject a cover_set_size() mint.
+        let n = 8usize;
         let values: Vec<u64> = (0..n as u64).map(|i| 10_000 + i).collect();
         // Mint payload built against an EMPTY transparent input set (matches the
         // tx's empty inputs, so the hook re-derives identical outpoints). The
@@ -4998,9 +5016,7 @@ mod tests {
         use crate::consensus::spark_payload::derive_outpoint;
         use crate::storage::spark_pool::SparkPoolStore;
         use crate::transaction::{Transaction, TxType};
-        use spark_connector::ffi::{
-            address_from_seed, cover_set_size, spend_outputs, LibsparkBackend,
-        };
+        use spark_connector::ffi::{address_from_seed, spend_outputs, LibsparkBackend};
         use spark_connector::SparkBackend;
         use std::sync::Arc;
         use std::time::{Duration, Instant};
@@ -5018,7 +5034,9 @@ mod tests {
         let mut chain = Blockchain::new();
         chain.spark_pool_store = Some(Arc::new(SparkPoolStore::new()));
         let store = Arc::clone(chain.spark_pool_store.as_ref().unwrap());
-        let n = cover_set_size().expect("cover set size");
+        // #311: small mint, not the full cover set (production N=32768 makes
+        // build_mint_payload reject a cover_set_size() mint).
+        let n = 8usize;
         assert!(n >= 2, "soak needs a cover set of at least 2 coins");
         // A fixed second wallet: transfer recipient, distinct from the per-cycle
         // sender seed. Its address is stable across cycles.
