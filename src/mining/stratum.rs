@@ -73,7 +73,8 @@
 //!   submission, or a mined block that never reaches peers. TESTS:
 //!   `submit_and_broadcast_without_candidate_returns_false`, `stratum_submit_produces_block`.
 //! - **§9 `share_tally` / `credit_share` / `load_tally` / `persist_tally` /
-//!   `spawn_job_updater`** — INVARIANT: `share_tally` weights valid shares per
+//!   `spawn_job_updater` / `close_round` / `worker_stats` / `share_work`** —
+//!   INVARIANT: `share_tally` weights valid shares per
 //!   login and skips empty logins; the tally is kept on `StratumStats`, not on
 //!   the connection, and the job updater writes it to the tally file whenever
 //!   it moved (temp file + rename, and once more from `flush_tally` at node
@@ -81,12 +82,19 @@
 //!   `write_tally` lets one writer at a time hold the file from snapshot to
 //!   rename, so an older snapshot never lands over a newer file; an
 //!   unparseable tally is moved aside as `<file>.corrupt` rather than started
-//!   over; the job updater rotates jobs on tip change. THREAT: mis-weighted
-//!   payout accounting, or credit lost with a dropped connection, a torn
+//!   over. `close_round` moves the tally to a dated file and empties it under
+//!   one lock, so no share lands in two rounds or in none, and it never
+//!   overwrites an existing round file. `worker_stats` and `stats().hashrate`
+//!   count the real (power-of-two) share target per valid share, `share_work`.
+//!   The job updater rotates jobs on tip change. THREAT: mis-weighted payout
+//!   accounting, or credit lost with a dropped connection, a round close, a torn
 //!   write or two writers. TESTS:
 //!   `share_tally_weights_valid_shares_per_login_skips_empty`,
 //!   `share_tally_survives_disconnect_and_reload`,
 //!   `test_load_tally_corrupt_json_is_safe_empty`,
+//!   `close_round_moves_the_tally_to_a_dated_file_and_starts_the_next_from_zero`,
+//!   `worker_stats_and_pool_hashrate_follow_the_work_behind_valid_shares`,
+//!   `share_work_is_the_power_of_two_target_difficulty`,
 //!   `flush_tally_replaces_the_file_and_leaves_no_tmp`,
 //!   `flush_tally_waits_for_the_running_writer`.
 //! - **§10 coinbase / merkle helpers (`create_coinbase_prefix` / `create_coinbase_suffix`
@@ -494,6 +502,8 @@ struct Worker {
     stale_shares: u64,
     /// Invalid shares
     invalid_shares: u64,
+    /// Hashes behind the valid shares, see `share_work`.
+    work: u64,
     /// Difficulty
     difficulty: u64,
     /// Vardiff: wanted shares per minute (0 = off), valid shares since
@@ -512,11 +522,18 @@ struct Worker {
     invalid_breaker: crate::colony::guard::breaker::CircuitBreaker,
     /// Last activity timestamp
     last_activity: u64,
+    /// When the connection came up
+    connected_at: u64,
     /// Message sender
     tx: mpsc::Sender<String>,
 }
 
 impl Worker {
+    /// Average hashrate since the connection came up, from `work`.
+    fn hashrate(&self, now: u64) -> u64 {
+        self.work / now.saturating_sub(self.connected_at).max(1)
+    }
+
     /// The difficulty a share is checked and credited at: the current one, or
     /// the lower of current and previous right after a step, so a share found
     /// against the old target is not thrown away.
@@ -570,6 +587,30 @@ impl Worker {
     }
 }
 
+/// One connection as `get_stratum_stats` reports it.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct WorkerStats {
+    pub id: u64,
+    pub login: String,
+    pub authorized: bool,
+    pub difficulty: u64,
+    pub valid_shares: u64,
+    pub stale_shares: u64,
+    pub invalid_shares: u64,
+    pub work: u64,
+    pub hashrate: u64,
+    pub connected_secs: u64,
+    pub last_submit_secs: Option<u64>,
+}
+
+/// What `close_round` moved out of the live tally.
+#[derive(Clone, Debug)]
+pub struct ClosedRound {
+    pub file: PathBuf,
+    pub logins: usize,
+    pub credit: u128,
+}
+
 /// Stratum server statistics
 #[derive(Clone, Debug, Default)]
 pub struct StratumStats {
@@ -585,6 +626,9 @@ pub struct StratumStats {
     /// PoW solutions that met the block target and were submitted, regardless of
     /// whether the chain accepted them.
     pub block_pow_hits: u64,
+    /// Hashes behind all valid shares since start, see `share_work`.
+    pub work: u64,
+    /// Sum of the connected workers' average rates, filled by `stats()`.
     pub hashrate: f64,
     /// Difficulty-weighted valid shares per miner `login` (native protocol).
     /// Kept here rather than on the connection so a miner's credit survives
@@ -759,8 +803,88 @@ impl StratumServer {
     /// Get server statistics
     pub async fn stats(&self) -> StratumStats {
         let mut stats = self.stats.read().await.clone();
-        stats.connected_workers = self.workers.read().await.len();
+        let now = timestamp_now();
+        let workers = self.workers.read().await;
+        stats.connected_workers = workers.len();
+        stats.hashrate = workers.values().map(|w| w.hashrate(now)).sum::<u64>() as f64;
         stats
+    }
+
+    pub fn is_running(&self) -> bool {
+        self.running.load(Ordering::SeqCst)
+    }
+
+    pub fn config(&self) -> &StratumConfig {
+        &self.config
+    }
+
+    pub async fn current_job(&self) -> Option<MiningJob> {
+        self.current_job.read().await.clone()
+    }
+
+    /// One entry per connection, oldest first.
+    pub async fn worker_stats(&self) -> Vec<WorkerStats> {
+        let now = timestamp_now();
+        let now_ms = timestamp_now_ms();
+        let workers = self.workers.read().await;
+        let mut out: Vec<WorkerStats> = workers
+            .iter()
+            .map(|(id, w)| WorkerStats {
+                id: *id,
+                login: w.payout_login.clone(),
+                authorized: w.authorized,
+                difficulty: w.difficulty,
+                valid_shares: w.valid_shares,
+                stale_shares: w.stale_shares,
+                invalid_shares: w.invalid_shares,
+                work: w.work,
+                hashrate: w.hashrate(now),
+                connected_secs: now.saturating_sub(w.connected_at),
+                last_submit_secs: (w.last_submit_ms > 0)
+                    .then(|| now_ms.saturating_sub(w.last_submit_ms) / 1000),
+            })
+            .collect();
+        out.sort_by_key(|w| w.id);
+        out
+    }
+
+    /// Close the payout round: write the tally to a dated file next to the
+    /// live one and start the next round from zero. The swap and both writes
+    /// happen under the tally writer mutex and the stats lock, so a share
+    /// credited meanwhile lands in the new round and no other writer can put
+    /// an older snapshot over the emptied live file. Refuses to overwrite an
+    /// existing round file.
+    pub async fn close_round(&self) -> Result<ClosedRound> {
+        let path = self
+            .tally_path
+            .as_ref()
+            .ok_or_else(|| Error::InvalidState("no share tally file".into()))?;
+        let _writer = self.tally_lock.lock().await;
+        let mut stats = self.stats.write().await;
+        if stats.share_tally.is_empty() {
+            return Err(Error::InvalidState("share tally is empty".into()));
+        }
+        let file = path.with_extension(format!("{}.json", timestamp_now_ms()));
+        let raw = serde_json::to_string_pretty(&stats.share_tally)
+            .map_err(|e| Error::SerializationError(e.to_string()))?;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&file)
+            .and_then(|mut f| std::io::Write::write_all(&mut f, raw.as_bytes()))
+            .map_err(|e| Error::InvalidState(format!("{}: {}", file.display(), e)))?;
+        let round = std::mem::take(&mut stats.share_tally);
+        persist_tally(path, &stats.share_tally);
+        info!(
+            "Stratum round closed: {} logins written to {}",
+            round.len(),
+            file.display()
+        );
+        Ok(ClosedRound {
+            file,
+            logins: round.len(),
+            credit: round.values().fold(0u128, |a, c| a.saturating_add(*c)),
+        })
     }
 
     /// Per-login share tally for a PUBLIC-pool operator: each miner's valid
@@ -936,6 +1060,7 @@ impl StratumServer {
                 valid_shares: 0,
                 stale_shares: 0,
                 invalid_shares: 0,
+                work: 0,
                 difficulty: share_difficulty,
                 vardiff_per_minute,
                 window_shares: 0,
@@ -946,6 +1071,7 @@ impl StratumServer {
                 last_submit_ms: 0,
                 invalid_breaker: crate::colony::guard::breaker::CircuitBreaker::new("stratum_worker", "CYNC-GUARD-STRATUM", MAX_INVALID_STREAK as u64),
                 last_activity: timestamp_now(),
+                connected_at: timestamp_now(),
                 tx: tx.clone(),
             };
 
@@ -1440,9 +1566,11 @@ async fn handle_stratum_message(
                 );
             }
             {
+                let work = share_work(effective);
                 let mut wr = workers.write().await;
                 let credit = wr.get_mut(&worker_id).map(|w| {
                     w.valid_shares += 1;
+                    w.work += work;
                     w.invalid_breaker.record_success();
                     let stepped = w.retarget(
                         timestamp_now_ms(),
@@ -1454,8 +1582,9 @@ async fn handle_stratum_message(
                 let mut s = stats.write().await;
                 s.total_shares += 1;
                 s.valid_shares += 1;
+                s.work += work;
                 if let Some((login, stepped)) = credit {
-                    credit_share(&mut s.share_tally, &login, share_work(effective));
+                    credit_share(&mut s.share_tally, &login, work);
                     if let Some((new_difficulty, tx)) = stepped {
                         info!(
                             "vardiff: worker {} difficulty {}",
@@ -2256,6 +2385,7 @@ mod tests {
             valid_shares: 0,
             stale_shares: 0,
             invalid_shares: 0,
+            work: 0,
             difficulty: 1000,
             vardiff_per_minute: 0,
             window_shares: 0,
@@ -2267,6 +2397,7 @@ mod tests {
             last_submit_ms: timestamp_now_ms(),
             invalid_breaker: crate::colony::guard::breaker::CircuitBreaker::preloaded("stratum_worker", "CYNC-GUARD-STRATUM", MAX_INVALID_STREAK as u64, (MAX_INVALID_STREAK - 1) as u64),
             last_activity: timestamp_now(),
+            connected_at: timestamp_now(),
             tx,
         };
 
@@ -2409,6 +2540,7 @@ mod tests {
             valid_shares: 0,
             stale_shares: 0,
             invalid_shares: 0,
+            work: 0,
             difficulty: 1000,
             vardiff_per_minute: 0,
             window_shares: 0,
@@ -2419,6 +2551,7 @@ mod tests {
             last_submit_ms: 0,
             invalid_breaker: crate::colony::guard::breaker::CircuitBreaker::new("stratum_worker", "CYNC-GUARD-STRATUM", MAX_INVALID_STREAK as u64),
             last_activity: timestamp_now(),
+            connected_at: timestamp_now(),
             tx,
         };
         let workers = Arc::new(RwLock::new(HashMap::<u64, Worker>::new()));
@@ -2529,6 +2662,7 @@ mod tests {
             valid_shares: 0,
             stale_shares: 0,
             invalid_shares: 0,
+            work: 0,
             difficulty: 1000,
             vardiff_per_minute: 0,
             window_shares: 0,
@@ -2539,6 +2673,7 @@ mod tests {
             last_submit_ms: 0,
             invalid_breaker: crate::colony::guard::breaker::CircuitBreaker::new("stratum_worker", "CYNC-GUARD-STRATUM", MAX_INVALID_STREAK as u64),
             last_activity: timestamp_now(),
+            connected_at: timestamp_now(),
             tx,
         };
         let workers = Arc::new(RwLock::new(HashMap::<u64, Worker>::new()));
@@ -2690,6 +2825,7 @@ mod tests {
             valid_shares: 0,
             stale_shares: 0,
             invalid_shares: 0,
+            work: 0,
             difficulty: 1000,
             vardiff_per_minute: 0,
             window_shares: 0,
@@ -2700,6 +2836,7 @@ mod tests {
             last_submit_ms: 0,
             invalid_breaker: crate::colony::guard::breaker::CircuitBreaker::new("stratum_worker", "CYNC-GUARD-STRATUM", MAX_INVALID_STREAK as u64),
             last_activity: timestamp_now(),
+            connected_at: timestamp_now(),
             tx,
         }
     }
@@ -3356,6 +3493,103 @@ mod tests {
             assert_eq!(w.retarget(301_000, 1000, 2500), None);
         }
         assert_eq!(w.retarget(301_000, 1000, 2500), Some(2500));
+    }
+
+    #[tokio::test]
+    async fn worker_stats_and_pool_hashrate_follow_the_work_behind_valid_shares() {
+        let chain = Arc::new(crate::chain::Blockchain::new());
+        let mempool = crate::mempool::SharedMempool::new();
+        let server = StratumServer::new(StratumConfig::default(), chain, mempool);
+        {
+            let mut w = server.workers.write().await;
+            let mut a = mk_worker(true, vec![0, 0, 0, 0]);
+            a.payout_login = "miner.a".to_string();
+            a.valid_shares = 10;
+            a.work = 5120;
+            a.connected_at = timestamp_now() - 10;
+            a.last_submit_ms = timestamp_now_ms() - 3000;
+            w.insert(2, a);
+            w.insert(1, mk_worker(false, vec![0, 0, 0, 1]));
+        }
+        let ws = server.worker_stats().await;
+        assert_eq!(ws.iter().map(|w| w.id).collect::<Vec<_>>(), vec![1, 2]);
+        assert_eq!(ws[1].login, "miner.a");
+        assert_eq!(ws[1].valid_shares, 10);
+        assert_eq!(ws[1].work, 5120);
+        assert!((465..=512).contains(&ws[1].hashrate), "{}", ws[1].hashrate);
+        assert!(ws[1].connected_secs >= 10);
+        assert!(matches!(ws[1].last_submit_secs, Some(3) | Some(4)));
+        assert_eq!(ws[0].hashrate, 0);
+        assert_eq!(ws[0].last_submit_secs, None);
+        assert!(!ws[0].authorized);
+        let stats = server.stats().await;
+        assert_eq!(stats.connected_workers, 2);
+        assert_eq!(stats.hashrate as u64, ws[1].hashrate);
+    }
+
+    #[tokio::test]
+    async fn close_round_waits_for_the_running_writer() {
+        let chain = Arc::new(crate::chain::Blockchain::new());
+        let mempool = crate::mempool::SharedMempool::new();
+        let mut server = StratumServer::new(StratumConfig::default(), chain, mempool);
+        let uniq = format!(
+            "coincync-stratum-round-lock-{}-{}.json",
+            std::process::id(),
+            timestamp_now_ms()
+        );
+        let path = std::env::temp_dir().join(uniq);
+        server.tally_path = Some(path.clone());
+        let server = Arc::new(server);
+        credit_share(&mut server.stats.write().await.share_tally, "miner.a", 1000);
+        let writer = server.tally_lock.clone().lock_owned().await;
+        let closing = server.clone();
+        let close = tokio::spawn(async move { closing.close_round().await });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(!close.is_finished(), "the close waits for the writer");
+        drop(writer);
+        let round = close.await.expect("join").expect("close");
+        let _ = std::fs::remove_file(&round.file);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(round.logins, 1);
+        assert!(server.share_tally().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn close_round_moves_the_tally_to_a_dated_file_and_starts_the_next_from_zero() {
+        let chain = Arc::new(crate::chain::Blockchain::new());
+        let mempool = crate::mempool::SharedMempool::new();
+        let mut server = StratumServer::new(StratumConfig::default(), chain, mempool);
+        let uniq = format!(
+            "coincync-stratum-round-{}-{}.json",
+            std::process::id(),
+            timestamp_now_ms()
+        );
+        let path = std::env::temp_dir().join(uniq);
+        server.tally_path = Some(path.clone());
+        assert!(server.close_round().await.is_err());
+        {
+            let mut s = server.stats.write().await;
+            credit_share(&mut s.share_tally, "miner.a", 1000);
+            credit_share(&mut s.share_tally, "miner.b", 2500);
+        }
+        let round = server.close_round().await.expect("close");
+        assert_eq!(round.logins, 2);
+        assert_eq!(round.credit, 3500);
+        assert_ne!(round.file, path);
+        assert_eq!(round.file.parent(), path.parent());
+        let written = load_tally(&round.file);
+        let _ = std::fs::remove_file(&round.file);
+        assert_eq!(written.get("miner.a"), Some(&1000));
+        assert_eq!(written.get("miner.b"), Some(&2500));
+        let live = std::fs::read_to_string(&path).expect("live file");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(live.trim(), "{}");
+        assert!(server.share_tally().await.is_empty());
+        {
+            let mut s = server.stats.write().await;
+            credit_share(&mut s.share_tally, "miner.c", 7);
+        }
+        assert_eq!(server.share_tally().await.get("miner.c"), Some(&7));
     }
 
     /// Share::verify classifies a share as Valid / Block / Invalid purely by

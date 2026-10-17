@@ -77,7 +77,7 @@ coincync-node --network mainnet --stratum 0.0.0.0:3333 --stratum-address <POOL_A
 | CoinCync-native `login`/`job`/`submit`/`keepalived` protocol | ✅ done |
 | Fork-safe, mempool-synced submission | ✅ done |
 | Pool-wide **share difficulty** (job carries a share target below the block target) | ✅ done (`share_difficulty`, default 1000) |
-| Per-miner **share accounting** for reward-splitting | ✅ done (difficulty-weighted, `StratumServer::share_tally()`; kept per login, survives disconnects, written to `stratum_shares.json`) |
+| Per-miner **share accounting** for reward-splitting | ✅ done (difficulty-weighted, `StratumServer::share_tally()`; kept per login, survives disconnects, written to `stratum_shares.json`; read and closed over RPC) |
 | Per-worker **adaptive vardiff** (per-connection target that tracks its hashrate) | ✅ done (each connection starts at `share_difficulty` and is resized to its measured share rate; `COINCYNC_STRATUM_VARDIFF_TARGET` = shares per minute, default 10, 0 = off) |
 | Extranonce partitioning (avoid overlap at large scale) | partial: each rig starts at a random nonce, so rigs do not search the same nonces; server-assigned disjoint ranges not yet |
 | Client auto-reconnect | ✅ done (`run-pool` reconnects with backoff, 1 s doubling to 60 s; a rejected login exits instead of retrying into a ban) |
@@ -144,8 +144,15 @@ a difficulty-weighted valid-share count per miner `login` (conventionally
 `<miner_address>.<worker>`). The tally is kept per `login` rather than per
 connection and written to `stratum_shares.json` (path:
 `COINCYNC_STRATUM_TALLY_PATH`; written once a second and at shutdown), so it
-survives a miner's disconnect and a node restart. An operator distributes a
-matured block's coinbase
+survives a miner's disconnect and a node restart. The node's JSON-RPC reads it:
+`get_stratum_stats` returns the pool totals, a hashrate estimate and one entry
+per connected worker (login, difficulty, shares, work, hashrate, seconds since
+connect and last submit), `get_stratum_tally` returns the tally with credits as
+decimal strings, and `close_stratum_round` moves the tally to
+`stratum_shares.<unix time in ms>.json` next to the live file and starts the next
+round from zero, without a restart. The close is a mutating call and sits behind
+the same RPC auth as `submit_block`; none of the three is reachable through the
+public REST proxy. An operator distributes a matured block's coinbase
 in proportion to these weights — a simple proportional/PPLNS split. Each
 connection's share target is sized to its own hashrate (vardiff), so the weighted
 tally stays fair across mixed hardware. A share is credited with the hashes

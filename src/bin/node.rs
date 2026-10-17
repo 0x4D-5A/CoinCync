@@ -1840,7 +1840,7 @@ async fn start_node(
         }
     }
     info!("Starting RPC server on {}", rpc_listen);
-    let _rpc = start_rpc_server(
+    let rpc = start_rpc_server(
         chain_arc.clone(),
         mempool.clone(),
         Some(p2p.clone()),
@@ -2052,6 +2052,7 @@ async fn start_node(
                     )
                     .with_p2p(p2p.clone()),
                 );
+                rpc.attach_stratum(server.clone());
                 info!(
                     "Starting Stratum pool on {} (block_production={})",
                     bind_addr, block_production

@@ -8,15 +8,17 @@ mod chain;
 mod mining;
 mod node;
 mod privacy;
+mod stratum;
 mod transactions;
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use jsonrpsee::RpcModule;
 
 use crate::chain::SharedBlockchain;
 use crate::error::Result;
 use crate::mempool::SharedMempool;
+use crate::mining::stratum::StratumServer;
 use crate::network::P2PNode;
 
 pub use audit::MAX_RPC_AUDIT_BLOCK_SPAN;
@@ -35,6 +37,8 @@ pub(super) struct RpcState {
     pub(super) stratum_native_tls_enabled: bool,
     pub(super) stratum_tls_proxy_ack: bool,
     pub(super) stratum_transport_hardened: bool,
+    /// The pool, attached by the node once it starts it (after the RPC).
+    pub(super) stratum: Arc<OnceLock<Arc<StratumServer>>>,
 }
 
 pub(super) fn create_rpc_module(state: RpcState) -> Result<RpcModule<RpcState>> {
@@ -42,6 +46,7 @@ pub(super) fn create_rpc_module(state: RpcState) -> Result<RpcModule<RpcState>> 
     node::register(&mut module)?;
     chain::register(&mut module)?;
     mining::register(&mut module)?;
+    stratum::register(&mut module)?;
     transactions::register(&mut module)?;
     privacy::register(&mut module)?;
     audit::register(&mut module)?;
