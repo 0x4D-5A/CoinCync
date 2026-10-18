@@ -152,7 +152,11 @@ decimal strings, and `close_stratum_round` moves the tally to
 `stratum_shares.<unix time in ms>.json` next to the live file and starts the next
 round from zero, without a restart. The close is a mutating call and sits behind
 the same RPC auth as `submit_block`; none of the three is reachable through the
-public REST proxy. An operator distributes a matured block's coinbase
+public REST proxy. A login is 1 to 256 bytes with no control characters, and
+the tally holds at most 10 000 distinct logins: once it is full, a login it
+does not know yet is refused with `pool full` until the round is closed, while
+the miners it already credits keep working. An operator distributes a matured
+block's coinbase
 in proportion to these weights — a simple proportional/PPLNS split. Each
 connection's share target is sized to its own hashrate (vardiff), so the weighted
 tally stays fair across mixed hardware. A share is credited with the hashes
